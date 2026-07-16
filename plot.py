@@ -2,8 +2,10 @@
 
 Usage:
     python plot.py --file path/to/data.sacc [--port 8050]
+    python plot.py --registry-path <dataset relative_path in the DESC Data Registry> [--port 8050]
 """
 import argparse
+import functools
 import re
 
 import numpy as np
@@ -14,7 +16,7 @@ from plotly.colors import sample_colorscale
 from plotly.subplots import make_subplots
 import dash
 from dash import dcc, html
-from dash.dependencies import Input, Output
+from dash.dependencies import Input, Output, State
 import sacc
 
 FONT_FAMILY = "'Source Sans 3', 'Source Sans Pro', sans-serif"
@@ -411,14 +413,100 @@ def make_covariance_figure(s, df, mode):
 
     return fig
 
-### Build the interactive app
-def build_app(sacc_path):
-    s = load_sacc(sacc_path)
-    df = build_data_vector_df(s)
-    nz_df = build_nz_df(s)
+@functools.lru_cache(maxsize = 4)
+def load_dataset_bundle(sacc_path):
+    """ load_dataset_bundle
+
+        Inputs:
+        - sacc_path (str): path to a .sacc file
+
+        Process:
+        - Loads the sacc file and derives everything the dashboard needs from it.
+        Cached by path, so switching back to an already-seen dataset (including the
+        one the app started with) is instant, and the figure callbacks below don't
+        reparse the FITS file on every interaction with an unrelated control.
+
+        Outputs:
+        - s (sacc.sacc.Sacc)
+        - df (Pandas DataFrame), output of build_data_vector_df
+        - nz_df (Pandas DataFrame), output of build_nz_df
+        - data_types (list of str)
+        - tracers (list of str)
+        - has_cov (bool)
+    """
+    s          = load_sacc(sacc_path)
+    df         = build_data_vector_df(s)
+    nz_df      = build_nz_df(s)
     data_types = list(df["data_type"].unique())
-    tracers = sorted(nz_df["tracer"].unique(), key=natural_key)
-    has_cov = s.covariance is not None
+    tracers    = sorted(nz_df["tracer"].unique(), key = natural_key)
+    has_cov    = s.covariance is not None
+    return s, df, nz_df, data_types, tracers, has_cov
+
+
+def make_cov_tab_content(has_cov):
+    """ make_cov_tab_content
+
+        Inputs:
+        - has_cov (bool)
+
+        Process:
+        - Builds the Covariance tab's children: the mode selector + graph if the
+        dataset has a covariance matrix, or an explanatory message if it doesn't
+
+        Outputs:
+        - children (list of Dash components)
+    """
+    return (
+        [
+            dcc.RadioItems(
+                id      = "cov-mode",
+                options = [
+                    {"label": "Correlation", "value": "correlation"},
+                    {"label": "Covariance (signed log10)", "value": "covariance"},
+                    {"label": "Precision (inverse covariance)", "value": "precision"},
+                ],
+                value  = "correlation",
+                inline = True,
+                style  = {"marginTop": "10px"},
+            ),
+            dcc.Graph(id = "cov-graph"),
+        ]
+        if has_cov
+        else [html.P("No covariance matrix present in this sacc file.")]
+    )
+
+
+### Build the interactive app
+def build_app(sacc_path=None):
+    """ build_app
+
+        Inputs:
+        - sacc_path (str or None): path to the .sacc file to load at startup.
+        If None, the app boots with no dataset loaded -- just the "Load from
+        Registry" box -- until one is loaded from the DESC Data Registry.
+
+        Process:
+        - Builds the Dash app layout and callbacks. The currently-loaded dataset's
+        path lives in a dcc.Store, so it can change at runtime (via the "Load from
+        Registry" box) without restarting the app: a callback keyed off the store
+        rebuilds the dropdown/checklist/covariance-tab options, and the three figure
+        callbacks reload their data from the store's current path.
+
+        Outputs:
+        - app (dash.Dash)
+    """
+    if sacc_path:
+        _, df, _, data_types, tracers, has_cov = load_dataset_bundle(sacc_path)
+        dataset_info_children = [
+            html.H4(f"From file: {sacc_path}"),
+            html.P(f"Found {len(df)} data points, {len(tracers)} tracers, covariance: {has_cov}"),
+        ]
+    else:
+        data_types, tracers, has_cov = [], [], False
+        dataset_info_children = [
+            html.H4("No dataset loaded"),
+            html.P("Use the box above to load a dataset from the DESC Data Registry."),
+        ]
 
     app = dash.Dash(
         __name__,
@@ -426,11 +514,39 @@ def build_app(sacc_path):
     )
     app.title = "sacc dashboard"
 
+    ### The Covariance tab's children get swapped in by a callback after the initial
+    ### layout (has_cov can change between datasets), which Dash's startup validation
+    ### would otherwise reject since it can't see those ids in the initial layout
+    app.config.suppress_callback_exceptions = True
+
     app.layout = html.Div(
         [
-            html.H2(f"DESC Dark Energy Exploration Dashboard"),
-            html.H4(f"From file: {sacc_path}"),
-            html.P(f"Found {len(df)} data points, {len(s.tracers)} tracers, covariance: {has_cov}"),
+            html.H2("DESC Dark Energy Exploration Dashboard"),
+
+            ### Query the DESC Data Registry (https://desc-dataregistry.lbl.gov) for a
+            ### different dataset, by relative_path (unique, unlike name), without
+            ### restarting the app
+            html.Div(
+                [
+                    dcc.Input(
+                        id          = "registry-path-input",
+                        type        = "text",
+                        placeholder = "dataset relative_path in DESC Data Registry",
+                        style       = {"width": "350px"},
+                    ),
+                    html.Button("Load from Registry", id = "registry-load-button", n_clicks = 0),
+                ],
+                style = {"marginTop": "10px"},
+            ),
+            html.Div(id = "registry-status", style = {"color": "crimson"}),
+
+            html.Div(
+                id       = "dataset-info",
+                children = dataset_info_children,
+            ),
+
+            dcc.Store(id = "sacc-path-store", data = sacc_path),
+
             dcc.Tabs(
                 [
                     dcc.Tab(
@@ -439,7 +555,7 @@ def build_app(sacc_path):
                             dcc.Dropdown(
                                 id="data-type-dropdown",
                                 options=[{"label": data_type_label(dt), "value": dt} for dt in data_types],
-                                value=data_types[0],
+                                value=data_types[0] if data_types else None,
                                 clearable=False,
                                 style={"width": "500px", "marginTop": "10px"},
                             ),
@@ -460,24 +576,10 @@ def build_app(sacc_path):
                         ],
                     ),
                     dcc.Tab(
-                        label="Covariance",
-                        children=(
-                            [
-                                dcc.RadioItems(
-                                    id="cov-mode",
-                                    options=[
-                                        {"label": "Correlation", "value": "correlation"},
-                                        {"label": "Covariance (signed log10)", "value": "covariance"},
-                                        {"label": "Precision (inverse covariance)", "value": "precision"},
-                                    ],
-                                    value="correlation",
-                                    inline=True,
-                                    style={"marginTop": "10px"},
-                                ),
-                                dcc.Graph(id="cov-graph"),
-                            ]
-                            if has_cov
-                            else [html.P("No covariance matrix present in this sacc file.")]
+                        label    = "Covariance",
+                        children = html.Div(
+                            id       = "cov-tab-content",
+                            children = make_cov_tab_content(has_cov) if sacc_path else [html.P("No dataset loaded.")],
                         ),
                     ),
                 ]
@@ -486,24 +588,86 @@ def build_app(sacc_path):
         style = {"fontFamily": FONT_FAMILY},
     )
 
-    @app.callback(Output("data-vector-graph", "figure"), Input("data-type-dropdown", "value"))
-    def update_data_vector(data_type):
+    @app.callback(
+        Output("data-vector-graph", "figure"),
+        Input("data-type-dropdown", "value"),
+        Input("sacc-path-store", "data"),
+    )
+    def update_data_vector(data_type, sacc_path):
+        if not sacc_path or not data_type:
+            return go.Figure()
+        _, df, _, _, _, _ = load_dataset_bundle(sacc_path)
         return make_data_vector_figure(df, data_type)
 
-    @app.callback(Output("nz-graph", "figure"), Input("tracer-checklist", "value"))
-    def update_nz(selected_tracers):
+    @app.callback(
+        Output("nz-graph", "figure"),
+        Input("tracer-checklist", "value"),
+        Input("sacc-path-store", "data"),
+    )
+    def update_nz(selected_tracers, sacc_path):
+        if not sacc_path:
+            return go.Figure()
+        _, _, nz_df, _, _, _ = load_dataset_bundle(sacc_path)
         return make_nz_figure(nz_df, selected_tracers or [])
 
-    if has_cov:
-        @app.callback(Output("cov-graph", "figure"), Input("cov-mode", "value"))
-        def update_cov(mode):
-            return make_covariance_figure(s, df, mode)
+    @app.callback(
+        Output("cov-graph", "figure"),
+        Input("cov-mode", "value"),
+        Input("sacc-path-store", "data"),
+    )
+    def update_cov(mode, sacc_path):
+        if not sacc_path:
+            return go.Figure()
+        s, df, _, _, _, has_cov = load_dataset_bundle(sacc_path)
+        if not has_cov:
+            return dash.no_update
+        return make_covariance_figure(s, df, mode)
+
+    @app.callback(
+        Output("dataset-info", "children"),
+        Output("data-type-dropdown", "options"),
+        Output("data-type-dropdown", "value"),
+        Output("tracer-checklist", "options"),
+        Output("tracer-checklist", "value"),
+        Output("cov-tab-content", "children"),
+        Input("sacc-path-store", "data"),
+        prevent_initial_call = True,
+    )
+    def update_dataset_controls(sacc_path):
+        _, df, _, data_types, tracers, has_cov = load_dataset_bundle(sacc_path)
+
+        info = [
+            html.H4(f"From file: {sacc_path}"),
+            html.P(f"Found {len(df)} data points, {len(tracers)} tracers, covariance: {has_cov}"),
+        ]
+        dropdown_options  = [{"label": data_type_label(dt), "value": dt} for dt in data_types]
+        checklist_options = [{"label": t, "value": t} for t in tracers]
+
+        return info, dropdown_options, data_types[0], checklist_options, tracers, make_cov_tab_content(has_cov)
+
+    @app.callback(
+        Output("sacc-path-store", "data"),
+        Output("registry-status", "children"),
+        Input("registry-load-button", "n_clicks"),
+        State("registry-path-input", "value"),
+        prevent_initial_call = True,
+    )
+    def load_from_registry(n_clicks, relative_path):
+        if not relative_path:
+            return dash.no_update, "Enter a dataset relative_path to look up."
+
+        try:
+            path = resolve_registry_path(relative_path)
+        except Exception as e:
+            return dash.no_update, f"Error: {e}"
+
+        return path, f"Loaded {relative_path!r} from the DESC Data Registry."
 
     return app
 
 
-def sacc_file_path(path):
-    """ sacc_file_path
+def check_sacc_extension(path):
+    """ check_sacc_extension
 
         Inputs:
         - path (str): candidate path to a .sacc file
@@ -515,17 +679,84 @@ def sacc_file_path(path):
         - path (str), unchanged, if valid
     """
     if not path.endswith(".sacc"):
-        raise argparse.ArgumentTypeError(f"expected a .sacc file, got: {path!r}")
+        raise ValueError(f"expected a .sacc file, got: {path!r}")
     return path
+
+
+def sacc_file_path(path):
+    """ sacc_file_path
+
+        argparse `type=` wrapper around check_sacc_extension, for --file validation
+    """
+    try:
+        return check_sacc_extension(path)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(str(e)) from e
+
+
+def resolve_registry_path(relative_path, config_file=None):
+    """ resolve_registry_path
+
+        Inputs:
+        - relative_path (str): the dataset's relative_path in the DESC Data
+        Registry (relative to its root_dir) -- unlike name, this is unique,
+        so no owner/version disambiguation is needed
+        - config_file (str or None): path to a dataregistry config file;
+        None uses the library's default config resolution (NERSC by default)
+
+        Process:
+        - Queries the DESC Data Registry (https://desc-dataregistry.lbl.gov) for a
+        dataset with this exact relative_path
+        - Requires exactly one match, then resolves its absolute path on disk
+        - Checks that the resolved path is a .sacc file
+
+        Outputs:
+        - path (str): absolute path of the registered dataset
+    """
+    from dataregistry import DataRegistry, Filter
+
+    registry = DataRegistry(config_file = config_file)
+    matches  = registry.find_datasets(
+        property_names = ["dataset.dataset_id", "dataset.relative_path"],
+        filters        = [Filter("dataset.relative_path", "==", relative_path)],
+    )
+
+    ### find_datasets returns None (rather than raising) on a query/connection error
+    if matches is None:
+        raise RuntimeError("DESC Data Registry query failed -- check connection/config")
+
+    dataset_ids = matches["dataset.dataset_id"]
+
+    if len(dataset_ids) == 0:
+        raise ValueError(f"No dataset with relative_path {relative_path!r} found in the DESC Data Registry")
+    if len(dataset_ids) > 1:
+        raise ValueError(
+            f"{len(dataset_ids)} datasets with relative_path {relative_path!r} found in the DESC Data Registry; "
+            f"expected exactly 1 (dataset_ids: {dataset_ids})"
+        )
+
+    path = registry.get_dataset_absolute_path(dataset_ids[0], silent = False)
+    return check_sacc_extension(path)
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--file", required = True, type = sacc_file_path, help = "path to a .sacc file")
-    parser.add_argument("--port", type=int, default=8050)
+    group  = parser.add_mutually_exclusive_group(required = False)
+    group.add_argument("--file", type = sacc_file_path, help = "path to a local .sacc file")
+    group.add_argument("--registry-path", help = "dataset relative_path to look up in the DESC Data Registry")
+    parser.add_argument("--registry-config", default = None, help = "optional dataregistry config file (defaults to NERSC config resolution)")
+    parser.add_argument("--port", type = int, default = 8050)
     args = parser.parse_args()
 
-    app = build_app(args.file)
+    if args.registry_path:
+        try:
+            sacc_path = resolve_registry_path(args.registry_path, config_file = args.registry_config)
+        except Exception as e:
+            parser.error(f"--registry-path lookup failed: {e}")
+    else:
+        sacc_path = args.file
+
+    app = build_app(sacc_path)
     app.run(debug=True, port=args.port)
 
 
