@@ -7,6 +7,7 @@ Usage:
 import argparse
 import functools
 import re
+import subprocess
 
 import numpy as np
 import pandas as pd
@@ -739,6 +740,26 @@ def resolve_registry_path(relative_path, config_file=None):
     return check_sacc_extension(path)
 
 
+def kill_port(port):
+    """ kill_port
+
+        Inputs:
+        - port (int): local port to free
+
+        Process:
+        - Finds any process(es) currently listening on this port (via `lsof`) and
+        kills them. In debug mode, Dash's Werkzeug reloader runs as a separate
+        child process, so quitting the main process alone can leave the port bound.
+
+        Outputs:
+        - None
+    """
+    result = subprocess.run(["lsof", "-ti", f":{port}"], capture_output = True, text = True)
+    pids   = [pid for pid in result.stdout.split() if pid]
+    for pid in pids:
+        subprocess.run(["kill", "-9", pid])
+
+
 def main():
     parser = argparse.ArgumentParser()
     group  = parser.add_mutually_exclusive_group(required = False)
@@ -757,7 +778,10 @@ def main():
         sacc_path = args.file
 
     app = build_app(sacc_path)
-    app.run(debug=True, port=args.port)
+    try:
+        app.run(debug=True, port=args.port)
+    finally:
+        kill_port(args.port)
 
 
 if __name__ == "__main__":
