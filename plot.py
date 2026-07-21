@@ -2,7 +2,7 @@
 
 Usage:
     python plot.py --file path/to/data.sacc [--port 8050]
-    python plot.py --registry-path <dataset relative_path in the DESC Data Registry> [--port 8050]
+    python plot.py --registry-id <dataset_id in the DESC Data Registry's working schema> [--port 8050]
 """
 import argparse
 import functools
@@ -525,14 +525,15 @@ def build_app(sacc_path=None):
             html.H2("DESC Dark Energy Exploration Dashboard"),
 
             ### Query the DESC Data Registry (https://desc-dataregistry.lbl.gov) for a
-            ### different dataset, by relative_path (unique, unlike name), without
-            ### restarting the app
+            ### different dataset, by dataset_id in the working schema (the primary
+            ### key, so it's unique by construction), without restarting the app
             html.Div(
                 [
                     dcc.Input(
-                        id          = "registry-path-input",
-                        type        = "text",
-                        placeholder = "dataset relative_path in DESC Data Registry",
+                        id          = "registry-id-input",
+                        type        = "number",
+                        step        = 1,
+                        placeholder = "dataset_id (working schema) in DESC Data Registry",
                         style       = {"width": "350px"},
                     ),
                     html.Button("Load from Registry", id = "registry-load-button", n_clicks = 0),
@@ -650,19 +651,24 @@ def build_app(sacc_path=None):
         Output("sacc-path-store", "data"),
         Output("registry-status", "children"),
         Input("registry-load-button", "n_clicks"),
-        State("registry-path-input", "value"),
+        State("registry-id-input", "value"),
         prevent_initial_call = True,
     )
-    def load_from_registry(n_clicks, relative_path):
-        if not relative_path:
-            return dash.no_update, "Enter a dataset relative_path to look up."
+    def load_from_registry(n_clicks, dataset_id):
+        if dataset_id is None:
+            return dash.no_update, "Enter a dataset_id to look up."
 
         try:
-            path = resolve_registry_path(relative_path)
+            dataset_id = int(dataset_id)
+        except (TypeError, ValueError):
+            return dash.no_update, f"dataset_id must be an integer, got: {dataset_id!r}"
+
+        try:
+            path = resolve_registry_path(dataset_id)
         except Exception as e:
             return dash.no_update, f"Error: {e}"
 
-        return path, f"Loaded {relative_path!r} from the DESC Data Registry."
+        return path, f"Loaded dataset_id={dataset_id} from the DESC Data Registry (working schema)."
 
     return app
 
@@ -695,48 +701,28 @@ def sacc_file_path(path):
         raise argparse.ArgumentTypeError(str(e)) from e
 
 
-def resolve_registry_path(relative_path, config_file=None):
+def resolve_registry_path(dataset_id, config_file=None):
     """ resolve_registry_path
 
         Inputs:
-        - relative_path (str): the dataset's relative_path in the DESC Data
-        Registry (relative to its root_dir) -- unlike name, this is unique,
-        so no owner/version disambiguation is needed
+        - dataset_id (int): the dataset_id to look up in the DESC Data Registry's
+        working schema -- this is the table's primary key, so it's unique by
+        construction (unlike name or relative_path, no disambiguation is needed)
         - config_file (str or None): path to a dataregistry config file;
         None uses the library's default config resolution (NERSC by default)
 
         Process:
-        - Queries the DESC Data Registry (https://desc-dataregistry.lbl.gov) for a
-        dataset with this exact relative_path
-        - Requires exactly one match, then resolves its absolute path on disk
+        - Resolves the dataset's absolute path on disk directly by dataset_id,
+        restricted to the working schema (as opposed to production)
         - Checks that the resolved path is a .sacc file
 
         Outputs:
         - path (str): absolute path of the registered dataset
     """
-    from dataregistry import DataRegistry, Filter
+    from dataregistry import DataRegistry
 
     registry = DataRegistry(config_file = config_file)
-    matches  = registry.find_datasets(
-        property_names = ["dataset.dataset_id", "dataset.relative_path"],
-        filters        = [Filter("dataset.relative_path", "==", relative_path)],
-    )
-
-    ### find_datasets returns None (rather than raising) on a query/connection error
-    if matches is None:
-        raise RuntimeError("DESC Data Registry query failed -- check connection/config")
-
-    dataset_ids = matches["dataset.dataset_id"]
-
-    if len(dataset_ids) == 0:
-        raise ValueError(f"No dataset with relative_path {relative_path!r} found in the DESC Data Registry")
-    if len(dataset_ids) > 1:
-        raise ValueError(
-            f"{len(dataset_ids)} datasets with relative_path {relative_path!r} found in the DESC Data Registry; "
-            f"expected exactly 1 (dataset_ids: {dataset_ids})"
-        )
-
-    path = registry.get_dataset_absolute_path(dataset_ids[0], silent = False)
+    path     = registry.get_dataset_absolute_path(dataset_id, schema = "working", silent = False)
     return check_sacc_extension(path)
 
 
@@ -764,22 +750,27 @@ def main():
     parser = argparse.ArgumentParser()
     group  = parser.add_mutually_exclusive_group(required = False)
     group.add_argument("--file", type = sacc_file_path, help = "path to a local .sacc file")
-    group.add_argument("--registry-path", help = "dataset relative_path to look up in the DESC Data Registry")
+    group.add_argument("--registry-id", type = int, help = "dataset_id (in the working schema) to look up in the DESC Data Registry")
     parser.add_argument("--registry-config", default = None, help = "optional dataregistry config file (defaults to NERSC config resolution)")
     parser.add_argument("--port", type = int, default = 8050)
     args = parser.parse_args()
 
-    if args.registry_path:
+    if args.registry_id is not None:
         try:
-            sacc_path = resolve_registry_path(args.registry_path, config_file = args.registry_config)
+            sacc_path = resolve_registry_path(args.registry_id, config_file = args.registry_config)
         except Exception as e:
-            parser.error(f"--registry-path lookup failed: {e}")
+            parser.error(f"--registry-id lookup failed: {e}")
     else:
         sacc_path = args.file
 
     app = build_app(sacc_path)
     try:
-        app.run(debug=True, port=args.port)
+        ### use_reloader=False: Werkzeug's reloader runs the server in a second,
+        ### child process that (per testing) ignores a solitary SIGINT sent to just
+        ### the parent -- it relies on the terminal delivering Ctrl+C to the whole
+        ### process group. Disabling it keeps this to one process, so kill_port
+        ### below reliably runs on any exit path (Ctrl+C, error, or normal return).
+        app.run(debug=True, port=args.port, use_reloader=False)
     finally:
         kill_port(args.port)
 
