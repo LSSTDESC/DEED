@@ -5,3 +5,5 @@ plotly==6.9.0
 dash==4.4.0
 sacc==2.4
 lsstdesc-dataregistry==1.7.0
+scipy
+getdist

@@ -1,13 +1,20 @@
-"""Interactive dashboard for exploring the contents of a .sacc file.
+"""Interactive dashboard for exploring the contents of a .sacc file, or an
+MCMC chain .txt file. Datasets can also be swapped at runtime via the "Load
+from Registry" box (by dataset_id), for either file type.
 
 Usage:
     python plot.py --file path/to/data.sacc [--port 8050]
+    python plot.py --file path/to/chain.txt [--port 8050]
     python plot.py --registry-id <dataset_id in the DESC Data Registry's working schema> [--port 8050]
 """
 import argparse
+import base64
 import functools
+import os
 import re
 import subprocess
+import sys
+import tempfile
 
 import numpy as np
 import pandas as pd
@@ -20,7 +27,28 @@ from dash import dcc, html
 from dash.dependencies import Input, Output, State
 import sacc
 
+### Jessie Muir's chain-plotting utility lives outside this repo, in her own
+### NERSC directory -- not yet vendored in or made configurable, so this will
+### need revisiting before this app can run anywhere other than NERSC (e.g. Spin)
+CHAINPLOT_UTILS_DIR = "./Muir_plottingFiles"
+os.environ["Y6METHODSDIR"] = CHAINPLOT_UTILS_DIR
+sys.path.insert(0, CHAINPLOT_UTILS_DIR)
+from getdist_chainplot_utils import get_paramdict, make_chainplot
+
+### getdist_chainplot_utils sets rc('text', usetex=True) at import time, which
+### requires a real LaTeX install to render any text at all -- not available in
+### this environment, so revert to matplotlib's built-in mathtext renderer
+import matplotlib
+matplotlib.rc("text", usetex = False)
+
 FONT_FAMILY = "'Source Sans 3', 'Source Sans Pro', sans-serif"
+
+### Chain-file columns that are sampler bookkeeping rather than plottable
+### parameters (see get_paramdict in getdist_chainplot_utils.py)
+CHAIN_HOUSEKEEPING_COLS = {
+    "weight", "post", "like", "prior",
+    "old_weight", "old_post", "log_weight", "old_log_weight",
+}
 
 ### Layer a font-only template on top of the default "plotly" template, so every
 ### figure created below picks up Source Sans without needing font= on each call
@@ -414,6 +442,71 @@ def make_covariance_figure(s, df, mode):
 
     return fig
 
+def make_chain_figure(chain_path, params):
+    """ make_chain_figure
+
+        Inputs:
+        - chain_path (str): path to a .txt MCMC chain file
+        - params (list of str): chain column names to plot (must match
+          get_paramdict(chain_path) keys)
+
+        Process:
+        - Renders the requested parameters with make_chainplot into a temp PNG
+        (make_chainplot draws with matplotlib/getdist and saves to disk rather
+        than returning a Plotly figure), then reads it back as a base64 data
+        URI, since Dash can't point an <img> at an arbitrary filesystem path.
+        clearfig=True keeps make_chainplot from leaking a matplotlib figure
+        into memory on every checklist change.
+
+        Outputs:
+        - data URI (str) suitable for an html.Img's src
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        make_chainplot(
+            inputflist = [chain_path],
+            indatdir   = "",
+            params     = params,
+            outname    = "chain_plot",
+            inlabels   = [os.path.basename(chain_path)],
+            outdir     = tmpdir,
+            ftype      = "png",
+            clearfig   = True,
+        )
+        with open(os.path.join(tmpdir, "chain_plot.png"), "rb") as f:
+            encoded = base64.b64encode(f.read()).decode("ascii")
+    return f"data:image/png;base64,{encoded}"
+
+
+def make_chain_main_content(chain_path):
+    """ make_chain_main_content
+
+        Inputs:
+        - chain_path (str): path to a .txt MCMC chain file
+
+        Process:
+        - Builds the main-content children for a loaded chain dataset: a
+        checklist of the chain's parameters and an (initially empty) image
+        that the update_chain_plot callback fills in via make_chainplot
+
+        Outputs:
+        - children (list of Dash components)
+    """
+    pdict  = get_paramdict(chain_path)
+    params = sorted({k for k in pdict if k.islower() and k not in CHAIN_HOUSEKEEPING_COLS})
+
+    return [
+        html.H4(f"From file: {chain_path}"),
+        dcc.Checklist(
+            id      = "chain-param-checklist",
+            options = [{"label": p, "value": p} for p in params],
+            value   = params[:2],
+            inline  = True,
+            style   = {"marginTop": "10px"},
+        ),
+        html.Img(id = "chain-graph", style = {"marginTop": "10px"}),
+    ]
+
+
 @functools.lru_cache(maxsize = 4)
 def load_dataset_bundle(sacc_path):
     """ load_dataset_bundle
@@ -477,47 +570,121 @@ def make_cov_tab_content(has_cov):
     )
 
 
+def make_sacc_main_content(sacc_path):
+    """ make_sacc_main_content
+
+        Inputs:
+        - sacc_path (str): path to a .sacc file
+
+        Process:
+        - Builds the main-content children for a loaded sacc dataset: the
+        info panel and the Data vector / n(z) / Covariance tabs
+
+        Outputs:
+        - children (list of Dash components)
+    """
+    _, df, _, data_types, tracers, has_cov = load_dataset_bundle(sacc_path)
+
+    return [
+        html.Div(
+            [
+                html.H4(f"From file: {sacc_path}"),
+                html.P(f"Found {len(df)} data points, {len(tracers)} tracers, covariance: {has_cov}"),
+            ],
+        ),
+        dcc.Tabs(
+            [
+                dcc.Tab(
+                    label="Data vector",
+                    children=[
+                        dcc.Dropdown(
+                            id="data-type-dropdown",
+                            options=[{"label": data_type_label(dt), "value": dt} for dt in data_types],
+                            value=data_types[0] if data_types else None,
+                            clearable=False,
+                            style={"width": "500px", "marginTop": "10px"},
+                        ),
+                        dcc.Graph(id="data-vector-graph"),
+                    ],
+                ),
+                dcc.Tab(
+                    label="n(z)",
+                    children=[
+                        dcc.Checklist(
+                            id="tracer-checklist",
+                            options=[{"label": t, "value": t} for t in tracers],
+                            value=tracers,
+                            inline=True,
+                            style={"marginTop": "10px"},
+                        ),
+                        dcc.Graph(id="nz-graph"),
+                    ],
+                ),
+                dcc.Tab(
+                    label    = "Covariance",
+                    children = html.Div(
+                        id       = "cov-tab-content",
+                        children = make_cov_tab_content(has_cov),
+                    ),
+                ),
+            ]
+        ),
+    ]
+
+
+def make_main_content(path):
+    """ make_main_content
+
+        Inputs:
+        - path (str or None): path to the currently-loaded dataset, or None
+          if nothing has been loaded yet
+
+        Process:
+        - Dispatches on file extension to build the right main-content
+        children -- the sacc tabs, or the chain checklist+image -- so the
+        dataset-path-store callback below can swap the whole dashboard
+        between the two dataset kinds without restarting the app
+
+        Outputs:
+        - children (list of Dash components)
+    """
+    if not path:
+        return [html.P("Use the box above to load a dataset from the DESC Data Registry, or restart with --file.")]
+    if path.endswith(".txt"):
+        return make_chain_main_content(path)
+    return make_sacc_main_content(path)
+
+
 ### Build the interactive app
-def build_app(sacc_path=None):
+def build_app(initial_path=None):
     """ build_app
 
         Inputs:
-        - sacc_path (str or None): path to the .sacc file to load at startup.
-        If None, the app boots with no dataset loaded -- just the "Load from
-        Registry" box -- until one is loaded from the DESC Data Registry.
+        - initial_path (str or None): path to the .sacc or .txt file to load
+        at startup. If None, the app boots with no dataset loaded -- just the
+        "Load from Registry" box -- until one is loaded from the DESC Data
+        Registry.
 
         Process:
         - Builds the Dash app layout and callbacks. The currently-loaded dataset's
         path lives in a dcc.Store, so it can change at runtime (via the "Load from
         Registry" box) without restarting the app: a callback keyed off the store
-        rebuilds the dropdown/checklist/covariance-tab options, and the three figure
-        callbacks reload their data from the store's current path.
+        rebuilds the whole main-content area (sacc tabs or chain checklist,
+        whichever matches the new path's extension), and the figure callbacks
+        reload their data from the store's current path.
 
         Outputs:
         - app (dash.Dash)
     """
-    if sacc_path:
-        _, df, _, data_types, tracers, has_cov = load_dataset_bundle(sacc_path)
-        dataset_info_children = [
-            html.H4(f"From file: {sacc_path}"),
-            html.P(f"Found {len(df)} data points, {len(tracers)} tracers, covariance: {has_cov}"),
-        ]
-    else:
-        data_types, tracers, has_cov = [], [], False
-        dataset_info_children = [
-            html.H4("No dataset loaded"),
-            html.P("Use the box above to load a dataset from the DESC Data Registry."),
-        ]
-
     app = dash.Dash(
         __name__,
         external_stylesheets = ["https://fonts.googleapis.com/css2?family=Source+Sans+3:wght@400;600;700&display=swap"],
     )
-    app.title = "sacc dashboard"
+    app.title = "DESC Dark Energy Exploration Dashboard"
 
-    ### The Covariance tab's children get swapped in by a callback after the initial
-    ### layout (has_cov can change between datasets), which Dash's startup validation
-    ### would otherwise reject since it can't see those ids in the initial layout
+    ### main-content's children depend on which dataset kind is loaded, and can
+    ### be swapped by the update_main_content callback below, so Dash's startup
+    ### validation (which can't see ids that come and go dynamically) is disabled
     app.config.suppress_callback_exceptions = True
 
     app.layout = html.Div(
@@ -526,7 +693,9 @@ def build_app(sacc_path=None):
 
             ### Query the DESC Data Registry (https://desc-dataregistry.lbl.gov) for a
             ### different dataset, by dataset_id in the working schema (the primary
-            ### key, so it's unique by construction), without restarting the app
+            ### key, so it's unique by construction), without restarting the app.
+            ### Works for both sacc and chain datasets -- the resolved path's
+            ### extension decides which dashboard view gets rendered.
             html.Div(
                 [
                     dcc.Input(
@@ -542,113 +711,68 @@ def build_app(sacc_path=None):
             ),
             html.Div(id = "registry-status", style = {"color": "crimson"}),
 
-            html.Div(
-                id       = "dataset-info",
-                children = dataset_info_children,
-            ),
+            dcc.Store(id = "dataset-path-store", data = initial_path),
 
-            dcc.Store(id = "sacc-path-store", data = sacc_path),
-
-            dcc.Tabs(
-                [
-                    dcc.Tab(
-                        label="Data vector",
-                        children=[
-                            dcc.Dropdown(
-                                id="data-type-dropdown",
-                                options=[{"label": data_type_label(dt), "value": dt} for dt in data_types],
-                                value=data_types[0] if data_types else None,
-                                clearable=False,
-                                style={"width": "500px", "marginTop": "10px"},
-                            ),
-                            dcc.Graph(id="data-vector-graph"),
-                        ],
-                    ),
-                    dcc.Tab(
-                        label="n(z)",
-                        children=[
-                            dcc.Checklist(
-                                id="tracer-checklist",
-                                options=[{"label": t, "value": t} for t in tracers],
-                                value=tracers,
-                                inline=True,
-                                style={"marginTop": "10px"},
-                            ),
-                            dcc.Graph(id="nz-graph"),
-                        ],
-                    ),
-                    dcc.Tab(
-                        label    = "Covariance",
-                        children = html.Div(
-                            id       = "cov-tab-content",
-                            children = make_cov_tab_content(has_cov) if sacc_path else [html.P("No dataset loaded.")],
-                        ),
-                    ),
-                ]
-            ),
+            html.Div(id = "main-content", children = make_main_content(initial_path)),
         ],
         style = {"fontFamily": FONT_FAMILY},
     )
 
     @app.callback(
+        Output("main-content", "children"),
+        Input("dataset-path-store", "data"),
+        prevent_initial_call = True,
+    )
+    def update_main_content(path):
+        return make_main_content(path)
+
+    @app.callback(
         Output("data-vector-graph", "figure"),
         Input("data-type-dropdown", "value"),
-        Input("sacc-path-store", "data"),
+        Input("dataset-path-store", "data"),
     )
-    def update_data_vector(data_type, sacc_path):
-        if not sacc_path or not data_type:
+    def update_data_vector(data_type, path):
+        if not path or path.endswith(".txt") or not data_type:
             return go.Figure()
-        _, df, _, _, _, _ = load_dataset_bundle(sacc_path)
+        _, df, _, _, _, _ = load_dataset_bundle(path)
         return make_data_vector_figure(df, data_type)
 
     @app.callback(
         Output("nz-graph", "figure"),
         Input("tracer-checklist", "value"),
-        Input("sacc-path-store", "data"),
+        Input("dataset-path-store", "data"),
     )
-    def update_nz(selected_tracers, sacc_path):
-        if not sacc_path:
+    def update_nz(selected_tracers, path):
+        if not path or path.endswith(".txt"):
             return go.Figure()
-        _, _, nz_df, _, _, _ = load_dataset_bundle(sacc_path)
+        _, _, nz_df, _, _, _ = load_dataset_bundle(path)
         return make_nz_figure(nz_df, selected_tracers or [])
 
     @app.callback(
         Output("cov-graph", "figure"),
         Input("cov-mode", "value"),
-        Input("sacc-path-store", "data"),
+        Input("dataset-path-store", "data"),
     )
-    def update_cov(mode, sacc_path):
-        if not sacc_path:
+    def update_cov(mode, path):
+        if not path or path.endswith(".txt"):
             return go.Figure()
-        s, df, _, _, _, has_cov = load_dataset_bundle(sacc_path)
+        s, df, _, _, _, has_cov = load_dataset_bundle(path)
         if not has_cov:
             return dash.no_update
         return make_covariance_figure(s, df, mode)
 
     @app.callback(
-        Output("dataset-info", "children"),
-        Output("data-type-dropdown", "options"),
-        Output("data-type-dropdown", "value"),
-        Output("tracer-checklist", "options"),
-        Output("tracer-checklist", "value"),
-        Output("cov-tab-content", "children"),
-        Input("sacc-path-store", "data"),
-        prevent_initial_call = True,
+        Output("chain-graph", "src"),
+        Input("chain-param-checklist", "value"),
+        Input("dataset-path-store", "data"),
     )
-    def update_dataset_controls(sacc_path):
-        _, df, _, data_types, tracers, has_cov = load_dataset_bundle(sacc_path)
-
-        info = [
-            html.H4(f"From file: {sacc_path}"),
-            html.P(f"Found {len(df)} data points, {len(tracers)} tracers, covariance: {has_cov}"),
-        ]
-        dropdown_options  = [{"label": data_type_label(dt), "value": dt} for dt in data_types]
-        checklist_options = [{"label": t, "value": t} for t in tracers]
-
-        return info, dropdown_options, data_types[0], checklist_options, tracers, make_cov_tab_content(has_cov)
+    def update_chain_plot(selected_params, path):
+        if not path or not path.endswith(".txt") or not selected_params:
+            return ""
+        return make_chain_figure(path, selected_params)
 
     @app.callback(
-        Output("sacc-path-store", "data"),
+        Output("dataset-path-store", "data"),
         Output("registry-status", "children"),
         Input("registry-load-button", "n_clicks"),
         State("registry-id-input", "value"),
@@ -668,35 +792,36 @@ def build_app(sacc_path=None):
         except Exception as e:
             return dash.no_update, f"Error: {e}"
 
-        return path, f"Loaded dataset_id={dataset_id} from the DESC Data Registry (working schema)."
+        kind = "chain" if path.endswith(".txt") else "sacc"
+        return path, f"Loaded dataset_id={dataset_id} ({kind}) from the DESC Data Registry (working schema)."
 
     return app
 
 
-def check_sacc_extension(path):
-    """ check_sacc_extension
+def check_dataset_extension(path):
+    """ check_dataset_extension
 
         Inputs:
-        - path (str): candidate path to a .sacc file
+        - path (str): candidate path to a dataset file
 
         Process:
-        - Checks that path has the .sacc extension
+        - Checks that path has the .sacc or .txt (MCMC chain) extension
 
         Outputs:
         - path (str), unchanged, if valid
     """
-    if not path.endswith(".sacc"):
-        raise ValueError(f"expected a .sacc file, got: {path!r}")
+    if not (path.endswith(".sacc") or path.endswith(".txt")):
+        raise ValueError(f"expected a .sacc or .txt file, got: {path!r}")
     return path
 
 
-def sacc_file_path(path):
-    """ sacc_file_path
+def dataset_file_path(path):
+    """ dataset_file_path
 
-        argparse `type=` wrapper around check_sacc_extension, for --file validation
+        argparse `type=` wrapper around check_dataset_extension, for --file validation
     """
     try:
-        return check_sacc_extension(path)
+        return check_dataset_extension(path)
     except ValueError as e:
         raise argparse.ArgumentTypeError(str(e)) from e
 
@@ -714,7 +839,7 @@ def resolve_registry_path(dataset_id, config_file=None):
         Process:
         - Resolves the dataset's absolute path on disk directly by dataset_id,
         restricted to the working schema (as opposed to production)
-        - Checks that the resolved path is a .sacc file
+        - Checks that the resolved path is a .sacc or .txt (MCMC chain) file
 
         Outputs:
         - path (str): absolute path of the registered dataset
@@ -723,7 +848,7 @@ def resolve_registry_path(dataset_id, config_file=None):
 
     registry = DataRegistry(config_file = config_file)
     path     = registry.get_dataset_absolute_path(dataset_id, schema = "working", silent = False)
-    return check_sacc_extension(path)
+    return check_dataset_extension(path)
 
 
 def kill_port(port):
@@ -749,7 +874,7 @@ def kill_port(port):
 def main():
     parser = argparse.ArgumentParser()
     group  = parser.add_mutually_exclusive_group(required = False)
-    group.add_argument("--file", type = sacc_file_path, help = "path to a local .sacc file")
+    group.add_argument("--file", type = dataset_file_path, help = "path to a local .sacc file or a .txt MCMC chain file")
     group.add_argument("--registry-id", type = int, help = "dataset_id (in the working schema) to look up in the DESC Data Registry")
     parser.add_argument("--registry-config", default = None, help = "optional dataregistry config file (defaults to NERSC config resolution)")
     parser.add_argument("--port", type = int, default = 8050)
@@ -757,13 +882,13 @@ def main():
 
     if args.registry_id is not None:
         try:
-            sacc_path = resolve_registry_path(args.registry_id, config_file = args.registry_config)
+            initial_path = resolve_registry_path(args.registry_id, config_file = args.registry_config)
         except Exception as e:
             parser.error(f"--registry-id lookup failed: {e}")
     else:
-        sacc_path = args.file
+        initial_path = args.file
 
-    app = build_app(sacc_path)
+    app = build_app(initial_path)
     try:
         ### use_reloader=False: Werkzeug's reloader runs the server in a second,
         ### child process that (per testing) ignores a solitary SIGINT sent to just
