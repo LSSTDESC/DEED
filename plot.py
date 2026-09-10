@@ -27,6 +27,15 @@ from dash import dcc, html
 from dash.dependencies import Input, Output, State
 import sacc
 
+### getdist_chainplot_utils imports matplotlib.pyplot at import time, so the
+### backend has to be chosen before it. Dash serves callbacks on worker threads,
+### and the interactive macOS backend refuses to build a figure off the main
+### thread; Agg is non-interactive, which is all this app needs, since every
+### chain plot is written to a PNG and embedded rather than shown in a window.
+### On NERSC this went unnoticed -- with no display, matplotlib already picked Agg.
+import matplotlib
+matplotlib.use("Agg")
+
 ### Jessie Muir's chain-plotting utility lives outside this repo, in her own
 ### NERSC directory -- not yet vendored in or made configurable, so this will
 ### need revisiting before this app can run anywhere other than NERSC (e.g. Spin)
@@ -38,7 +47,6 @@ from getdist_chainplot_utils import get_paramdict, make_chainplot
 ### getdist_chainplot_utils sets rc('text', usetex=True) at import time, which
 ### requires a real LaTeX install to render any text at all -- not available in
 ### this environment, so revert to matplotlib's built-in mathtext renderer
-import matplotlib
 matplotlib.rc("text", usetex = False)
 
 FONT_FAMILY = "'Source Sans 3', 'Source Sans Pro', sans-serif"
