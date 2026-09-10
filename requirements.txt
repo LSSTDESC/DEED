@@ -4,6 +4,12 @@ matplotlib==3.11.0
 plotly==6.9.0
 dash==4.4.0
 sacc==2.4
-lsstdesc-dataregistry==1.7.0
 scipy
 getdist
+
+# lsstdesc-dataregistry deps, listed here because the package itself must be
+# installed with --no-deps (see requirements-dataregistry.txt)
+psycopg2-binary
+sqlalchemy>=2.0.16
+pyyaml
+globus-sdk>=4.4.0
