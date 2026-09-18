@@ -1,17 +1,19 @@
-"""Interactive dashboard for comparing several MCMC chains, or exploring the
-contents of a .sacc file.
+"""Interactive dashboard for comparing several MCMC chains or several .sacc
+files.
 
-Multi-dataset sibling of plot.py: several .txt MCMC chains can be loaded at
-once and are overplotted in a single getdist triangle/1D plot, one color (and
-linestyle) per chain. Datasets are added and removed at runtime -- by local
-path, or by dataset_id in the DESC Data Registry -- without restarting.
+Multi-dataset sibling of plot.py. Several .txt MCMC chains can be loaded at once
+and are overplotted in a single getdist triangle/1D plot, one color (and
+linestyle) per chain; several .sacc files can be loaded at once and are
+overplotted in the data-vector and n(z) views, one color (and marker symbol) per
+file. Datasets are added and removed at runtime -- by local path, or by
+dataset_id in the DESC Data Registry -- without restarting.
 
-.sacc files still display one at a time, exactly as in plot.py; overplotting
-data vectors is the next step.
+Covariance matrices are not overplotted -- heatmaps don't overlay -- so that tab
+shows one loaded file at a time, chosen from a dropdown.
 
 Usage:
     python plot_many.py --file path/to/chain_a.txt --file path/to/chain_b.txt [--port 8050]
-    python plot_many.py --file path/to/data.sacc [--port 8050]
+    python plot_many.py --file path/to/a.sacc --file path/to/b.sacc [--port 8050]
     python plot_many.py --registry-id <dataset_id in the DESC Data Registry's working schema> [--port 8050]
 
 --file and --registry-id are both repeatable, and can be mixed.
@@ -67,19 +69,41 @@ CHAIN_HOUSEKEEPING_COLS = {
     "old_weight", "old_post", "log_weight", "old_log_weight",
 }
 
-### One color per overplotted chain, in fixed order -- these are the first three
+### One color per overplotted dataset, in fixed order -- these are the first three
 ### slots of a categorical palette validated for color-vision deficiency with
 ### *every* pair compared, not just neighbouring pairs in a legend. A fourth hue
-### would break that, so instead of inventing new hues past three chains, the
-### same three repeat with a new linestyle: identity is carried by the
-### (color, linestyle) pair, which also survives greyscale printing.
+### would break that, so instead of inventing new hues past three datasets, the
+### same three repeat with a new second channel: identity is carried by the
+### (color, second channel) pair, which also survives greyscale printing.
+###
+### The second channel is a linestyle for chain contours and for n(z) curves, and
+### a marker symbol for data-vector points -- the data vector has no lines to
+### style, and its filled/open distinction is already spoken for by the sign of
+### the value (see make_data_vector_figure), so identity needs a third shape.
+### Both are indexed by the same style slot, so a dataset that is blue and dashed
+### in one view is blue and square in the other.
 DATASET_COLORS     = ["#2a78d6", "#eb6834", "#1baf7a"]
 DATASET_LINESTYLES = ["-", "--", ":"]
+DATASET_SYMBOLS    = ["circle", "square", "diamond"]
 LINESTYLE_NAMES    = {"-": "solid", "--": "dashed", ":": "dotted"}
+SYMBOL_NAMES       = {"circle": "circles", "square": "squares", "diamond": "diamonds"}
 
-### Cap on overplotted chains: past this there are no unique (color, linestyle)
-### pairs left, and a triangle plot of ten posteriors is unreadable anyway
+### Plotly spells matplotlib's linestyles differently; DATASET_LINESTYLES is kept
+### in matplotlib's form because make_chainplot passes it straight to matplotlib
+PLOTLY_DASHES = {"-": "solid", "--": "dash", ":": "dot"}
+
+### Cap on overplotted datasets of one kind: past this there are no unique
+### (color, second channel) pairs left, and a triangle plot of ten posteriors --
+### or a data-vector panel with ten points per bin -- is unreadable anyway
 MAX_OVERLAY_CHAINS = len(DATASET_COLORS) * len(DATASET_LINESTYLES)
+MAX_OVERLAY_SACCS  = len(DATASET_COLORS) * len(DATASET_SYMBOLS)
+MAX_OVERLAY        = {"chain": MAX_OVERLAY_CHAINS, "sacc": MAX_OVERLAY_SACCS}
+
+### Fractional x-offset applied per dataset when several data vectors are
+### overplotted, so points measured in the same angular bin don't hide each
+### other. Multiplicative because the x axes are logarithmic. The true x is
+### carried in customdata and is what the hover box reports.
+DATA_VECTOR_X_OFFSET = 0.02
 
 ### Parameters to select by default when comparing chains, if every loaded chain
 ### has them -- alphabetically-first columns (bias_lens--b1, b2) make a poor
@@ -227,24 +251,39 @@ def data_type_label(dt):
     }.get(dt, dt)
 
 
-def make_data_vector_figure(df, data_type):
+def make_data_vector_figure(saccs, frames, data_type):
     """ make_data_vector_figure
-    
+
         Inputs:
-        - df (Pandas DataFrame)
+        - saccs (list of dict): sacc dataset entries, in load order, supplying
+        the label/color/symbol each file is drawn with
+        - frames (list of Pandas DataFrame): the build_data_vector_df output for
+        each entry in saccs, in the same order
         - data_type (str)
-        
+
         Process:
-        - 
-        
+        - Draws every loaded file's data vector for this data type into one
+        triangular grid of tracer1 x tracer2 panels. Color identifies the file
+        and filled/open identifies the sign of the value -- the single-file
+        version of this figure used color for the sign, which multi-file has to
+        give up, so the marker symbol carries what's left of file identity
+        (see DATASET_SYMBOLS).
+        - The grid is the union of the tracer pairs across all files, so a file
+        with a different binning shows up as gaps rather than being cropped or
+        silently aligned to someone else's tracers.
+        - Files that have no data of this type at all are skipped; the
+        data-type dropdown annotates the option with who is missing from it
+        (see option_label), so their absence is stated rather than inferred.
+
         Outputs:
-        - 
+        - fig (plotly go.Figure)
     """
-    
-    ### Pick out the dataframe corresponding to data_type, and pick out the tracers
-    sub = df[df["data_type"] == data_type]
-    t1s = sorted(sub["tracer1"].unique(), key = natural_key)
-    t2s = sorted(sub["tracer2"].unique(), key = natural_key)
+
+    ### Pick out the rows corresponding to data_type, per file, and take the
+    ### union of the tracers so the grid covers every file's binning
+    subs = [df[df["data_type"] == data_type] for df in frames]
+    t1s  = sorted({t for sub in subs for t in sub["tracer1"].unique()}, key = natural_key)
+    t2s  = sorted({t for sub in subs for t in sub["tracer2"].unique()}, key = natural_key)
 
     ### Check if data are in real or Fourier space
     ### x_name/y_name are plain ASCII for hovertemplates; x_label/y_label are the
@@ -254,6 +293,11 @@ def make_data_vector_figure(df, data_type):
     y_name     = "xi"    if real_space else "Cl"
     x_label    = "θ"  if real_space else "ℓ"
     y_label    = "ξ"  if real_space else "Cℓ"
+
+    ### make_subplots needs at least one row and column, so bail out before it
+    ### rather than after: no loaded file carries this data type
+    if not t1s or not t2s:
+        return message_figure(f"No loaded file has any {data_type_label(data_type)} data points.")
 
     ### Generate figure
     fig = make_subplots(
@@ -276,51 +320,71 @@ def make_data_vector_figure(df, data_type):
     for i, t1 in enumerate(t1s):
         for j, t2 in enumerate(t2s):
 
-            panel = sub[(sub["tracer1"] == t1) & (sub["tracer2"] == t2)]
+            panels = [sub[(sub["tracer1"] == t1) & (sub["tracer2"] == t2)] for sub in subs]
 
-            if panel.empty:
+            if all(panel.empty for panel in panels):
                 continue
 
             bottom_row_for_col[j] = max(bottom_row_for_col.get(j, -1), i)
             left_col_for_row[i]   = min(left_col_for_row.get(i, len(t2s)), j)
 
-            ### Pick positive and negative values
-            pos = panel[panel["value"] >= 0]
-            neg = panel[panel["value"] < 0]
-            
-            ### Plot out positive values
-            if not pos.empty:
-                fig.add_trace(
-                    go.Scatter(
-                        x             = pos["x"],
-                        y             = pos["value"],
-                        error_y       = dict(type = "data", array = pos["err"], visible = True),
-                        mode          = "markers",
-                        marker        = dict(color = "royalblue", size = 6, symbol = "circle"),
-                        name          = f"{t1}-{t2} (+)",
-                        showlegend    = False,
-                        hovertemplate = f"{x_name}=%{{x:.1f}}<br>{y_name}=%{{y:.3e}}<extra></extra>",
-                    ),
-                    row = i + 1,
-                    col = j + 1,
-                )
-                
-            ### Plot out negative values
-            if not neg.empty:
-                fig.add_trace(
-                    go.Scatter(
-                        x             = neg["x"],
-                        y             = -neg["value"],
-                        error_y       = dict(type = "data", array = neg["err"], visible = True),
-                        mode          = "markers",
-                        marker        = dict(color = "crimson", size = 6, symbol = "circle-open"),
-                        name          = f"{t1}-{t2} (-)",
-                        showlegend    = False,
-                        hovertemplate = f"{x_name}=%{{x:.1f}}<br>-{y_name}=%{{y:.3e}}<extra></extra>",
-                    ),
-                    row = i + 1,
-                    col = j + 1,
-                )
+            for k, (entry, panel) in enumerate(zip(saccs, panels)):
+
+                if panel.empty:
+                    continue
+
+                ### Nudge this file's points off the shared bin center, so that
+                ### overlaid markers at the same ell/theta stay legible. The
+                ### undisplaced x rides along in customdata for the hover box.
+                x = panel["x"] * (1 + DATA_VECTOR_X_OFFSET * (k - (len(saccs) - 1) / 2)) if len(saccs) > 1 else panel["x"]
+
+                ### Pick positive and negative values
+                pos = panel["value"] >= 0
+
+                ### Plot out positive values filled, negative values open
+                for sign, mask, symbol in (("+", pos, entry["symbol"]), ("-", ~pos, f"{entry['symbol']}-open")):
+
+                    if not mask.any():
+                        continue
+
+                    fig.add_trace(
+                        go.Scatter(
+                            x             = x[mask],
+                            y             = panel["value"][mask].abs(),
+                            customdata    = panel["x"][mask],
+                            error_y       = dict(type = "data", array = panel["err"][mask], visible = True),
+                            mode          = "markers",
+                            marker        = dict(color = entry["color"], size = 6, symbol = symbol),
+                            name          = f"{entry['label']} {t1}-{t2} ({sign})",
+                            legendgroup   = entry["label"],
+                            showlegend    = False,
+                            hovertemplate = (
+                                f"{entry['label']}<br>{x_name}=%{{customdata:.1f}}<br>"
+                                f"{'-' if sign == '-' else ''}{y_name}=%{{y:.3e}}<extra></extra>"
+                            ),
+                        ),
+                        row = i + 1,
+                        col = j + 1,
+                    )
+
+    ### One legend entry per file, drawn from empty traces: the real traces are
+    ### split by panel and by sign, so any of them would key the legend to a
+    ### tracer pair rather than to the file
+    if len(saccs) > 1:
+        for entry in saccs:
+            fig.add_trace(
+                go.Scatter(
+                    x           = [None],
+                    y           = [None],
+                    mode        = "markers",
+                    marker      = dict(color = entry["color"], size = 8, symbol = entry["symbol"]),
+                    name        = entry["label"],
+                    legendgroup = entry["label"],
+                    showlegend  = True,
+                ),
+                row = 1,
+                col = 1,
+            )
 
     ### Plotting parameters
     fig.update_xaxes(type = "log")
@@ -332,29 +396,50 @@ def make_data_vector_figure(df, data_type):
         fig.update_xaxes(title_text = x_label, showticklabels = True, automargin = True, row = i + 1, col = j + 1)
     for i, j in left_col_for_row.items():
         fig.update_yaxes(title_text = y_label, showticklabels = True, automargin = True, row = i + 1, col = j + 1)
+
+    ### Say out loud that the markers are not sitting exactly on their bin
+    ### centers, since the axis is the one place a reader would check
+    offset_note = f", points offset by ±{100 * DATA_VECTOR_X_OFFSET:.0f}% in {x_label} per file" if len(saccs) > 1 else ""
+
     fig.update_layout(
         height = max(220 * len(t1s), 350),
-        width  = max(220 * len(t2s), 450),
-        title  = f"{data_type_label(data_type)} (filled = positive, open = |negative|)",
+        width  = max(220 * len(t2s), 450) + (180 if len(saccs) > 1 else 0),
+        title  = f"{data_type_label(data_type)} (filled = positive, open = |negative|{offset_note})",
         margin = dict(t = 80, l = 60, r = 20, b = 40),
     )
     return fig
 
 
-def make_nz_figure(nz_df, selected_tracers):
+def make_nz_figure(saccs, nz_frames, selected_tracers):
     """ make_nz_figure
-    
+
         Inputs:
-        - nz_df (Pandas DataFrame), containing the z and n(z) for each tracer
+        - saccs (list of dict): sacc dataset entries, in load order, supplying
+        the label and linestyle each file is drawn with
+        - nz_frames (list of Pandas DataFrame): the build_nz_df output for each
+        entry in saccs, in the same order, containing z and n(z) per tracer
         - selected_tracers (list of str), the list of tracers whose n(z)s we are plotting
-        
+
+        Process:
+        - Overlays every loaded file's n(z). Color stays keyed to the tracer, so
+        the same redshift bin keeps its color across files and the question this
+        view answers -- did this bin move between these two files? -- reads
+        directly. That leaves the linestyle to identify the file; the lens/source
+        distinction it used to carry is already carried by the color scale the
+        tracer is drawn from (Reds vs Blues).
+        - There are only three linestyles, so past three files the file's marker
+        symbol (the one it is drawn with in the data-vector view) is added to
+        the line to keep every file distinguishable.
+        - A tracer that only some files have is drawn for the files that have it.
+
         Outputs:
         - fig (plotly go.Figure)
-    
+
     """
 
-    ### Build a consistent colormap: lens tracers drawn from a reddish scale, others from a bluish scale
-    all_tracers  = sorted(nz_df["tracer"].unique(), key = natural_key)
+    ### Build a consistent colormap over every tracer in every file: lens tracers
+    ### drawn from a reddish scale, others from a bluish scale
+    all_tracers  = sorted({t for nz_df in nz_frames for t in nz_df["tracer"].unique()}, key = natural_key)
     lens_tracers = [name for name in all_tracers if "lens" in name.lower()]
     src_tracers  = [name for name in all_tracers if name not in lens_tracers]
 
@@ -363,19 +448,30 @@ def make_nz_figure(nz_df, selected_tracers):
     color_map   = dict(zip(lens_tracers, lens_colors)) | dict(zip(src_tracers, src_colors))
 
     ### Build the figure
-    fig = go.Figure()
-    for name in selected_tracers:
+    crowded = len(saccs) > len(DATASET_LINESTYLES)
 
-        sub = nz_df[nz_df["tracer"] == name]
-        fig.add_trace(
-            go.Scatter(
-                x    = sub["z"],
-                y    = sub["nz"],
-                mode = "lines",
-                name = name,
-                line = dict(color = color_map[name], dash = "solid" if name in lens_tracers else "dash"),
+    fig = go.Figure()
+    for entry, nz_df in zip(saccs, nz_frames):
+        for name in selected_tracers:
+
+            sub = nz_df[nz_df["tracer"] == name]
+
+            if sub.empty:
+                continue
+
+            fig.add_trace(
+                go.Scatter(
+                    x                  = sub["z"],
+                    y                  = sub["nz"],
+                    mode               = "lines+markers" if crowded else "lines",
+                    marker             = dict(symbol = entry["symbol"], size = 5, maxdisplayed = 12) if crowded else None,
+                    name               = name,
+                    legendgroup        = entry["label"],
+                    legendgrouptitle   = dict(text = entry["label"]) if len(saccs) > 1 else None,
+                    line               = dict(color = color_map[name], dash = PLOTLY_DASHES[entry["linestyle"]]),
+                    hovertemplate      = f"{entry['label']}<br>{name}<br>z=%{{x:.3f}}<br>n(z)=%{{y:.3f}}<extra></extra>",
+                )
             )
-        )
 
     ### Update plotting parameters
     fig.update_layout(
@@ -387,16 +483,50 @@ def make_nz_figure(nz_df, selected_tracers):
     return fig
 
 
-def make_covariance_figure(s, df, mode):
+def message_figure(text, height = 700, width = 750):
+    """ message_figure
+
+        Inputs:
+        - text (str): the message to show in place of a figure
+        - height, width (int): figure size, so the message occupies the space
+        the figure would have
+
+        Process:
+        - Builds an empty figure carrying a centered message. Used wherever a
+        view can't be drawn for a reason the reader should see rather than
+        being left with a blank panel.
+
+        Outputs:
+        - fig (plotly go.Figure)
+    """
+    fig = go.Figure()
+    fig.add_annotation(
+        text      = text,
+        showarrow = False,
+        xref      = "paper",
+        yref      = "paper",
+        x         = 0.5,
+        y         = 0.5,
+        font      = dict(size = 14),
+    )
+    fig.update_layout(height = height, width = width)
+    return fig
+
+
+def make_covariance_figure(s, df, mode, label = None):
     """ make_covariance_figure
 
         Inputs:
         - s (sacc file loaded into memory, sacc.sacc.Sacc)
         - df (Pandas DataFrame), output of build_data_vector_df, used for axis labels and block boundaries
         - mode (str), one of "correlation", "covariance", "precision"
+        - label (str or None): the dataset label, named in the title when
+        several sacc files are loaded and this is one of them
 
         Process:
-        - Builds the requested matrix representation of the covariance
+        - Builds the requested matrix representation of the covariance. One file
+        at a time: heatmaps can't be overlaid the way the data vector and n(z)
+        views overlay their curves, so the Covariance tab picks a file instead.
 
         Outputs:
         - fig (plotly go.Figure)
@@ -420,21 +550,10 @@ def make_covariance_figure(s, df, mode):
         ### Guard: refuse to invert a covariance that is too ill-conditioned to trust
         cond = np.linalg.cond(cov)
         if cond > 1.0 / np.finfo(cov.dtype).eps:
-            fig = go.Figure()
-            fig.add_annotation(
-                text      = (
-                    f"Precision matrix not shown: covariance is too ill-conditioned to invert "
-                    f"reliably (condition number = {cond:.2e})."
-                ),
-                showarrow = False,
-                xref      = "paper",
-                yref      = "paper",
-                x         = 0.5,
-                y         = 0.5,
-                font      = dict(size = 14),
+            return message_figure(
+                f"Precision matrix not shown: covariance is too ill-conditioned to invert "
+                f"reliably (condition number = {cond:.2e})."
             )
-            fig.update_layout(height = 700, width = 750)
-            return fig
 
         precision  = s.covariance.inverse
         matrix     = np.sign(precision) * np.log10(np.abs(precision) + 1e-30)
@@ -466,7 +585,7 @@ def make_covariance_figure(s, df, mode):
     
     ### Update plotting parameters
     fig.update_layout(
-        title  = title,
+        title  = f"{title} -- {label}" if label else title,
         height = 700,
         width  = 750,
         xaxis  = dict(showticklabels = False),
@@ -486,8 +605,10 @@ def make_covariance_figure(s, df, mode):
 ### The dashboard holds a list of datasets rather than a single path. Each entry
 ### is a plain dict (it lives in a dcc.Store, so it has to be JSON-serializable):
 ###
-###   {"path": str, "origin": str, "kind": "chain"|"sacc",
-###    "label": str, "slot": int|None, "color": str|None, "linestyle": str|None}
+###   {"path": str, "origin": str, "kind": "chain"|"sacc", "label": str,
+###    "slot": int, "color": str, "linestyle": str, "symbol": str|None}
+###
+### "symbol" is None for chains, which have no markers to style.
 ###
 ### Only "path" and "origin" are supplied when a dataset is added; the rest are
 ### filled in by normalize_datasets.
@@ -536,33 +657,37 @@ def dataset_labels(paths):
     return labels
 
 
-def assign_chain_slots(entries):
-    """ assign_chain_slots
+def assign_style_slots(entries):
+    """ assign_style_slots
 
         Inputs:
         - entries (list of dict): dataset entries, some already carrying a "slot"
 
         Process:
-        - Gives every chain entry a style slot, which indexes into
-        DATASET_COLORS/DATASET_LINESTYLES. Entries that already have one keep
-        it, and new entries take the lowest free slot -- so removing one chain
-        never repaints the others, and a chain's color means the same thing for
-        as long as it stays loaded. sacc entries get no slot: nothing is
-        color-coded by dataset in the sacc view yet.
+        - Gives every entry a style slot, which indexes into DATASET_COLORS and
+        DATASET_LINESTYLES/DATASET_SYMBOLS. Entries that already have one keep
+        it, and new entries take the lowest free slot -- so removing one dataset
+        never repaints the others, and a dataset's color means the same thing
+        for as long as it stays loaded.
+        - Chains and sacc files draw from separate slot pools: no figure mixes
+        the two kinds, so the first chain and the first sacc file can both be
+        blue without ever being confusable.
 
         Outputs:
         - None (entries are updated in place)
     """
-    chains = [e for e in entries if e["kind"] == "chain"]
-    taken  = {e["slot"] for e in chains if e.get("slot") is not None}
+    for kind, cap in MAX_OVERLAY.items():
 
-    for entry in entries:
-        if entry["kind"] != "chain":
-            entry["slot"] = None
-            continue
-        if entry.get("slot") is None:
-            entry["slot"] = next(slot for slot in range(MAX_OVERLAY_CHAINS) if slot not in taken)
-            taken.add(entry["slot"])
+        group = [e for e in entries if e["kind"] == kind]
+        taken = {e["slot"] for e in group if e.get("slot") is not None}
+
+        for entry in group:
+            if entry.get("slot") is None:
+                ### The caller caps how many datasets of a kind can be loaded
+                ### (add_dataset, and main() for the command line), so a free
+                ### slot always exists by the time this runs
+                entry["slot"] = next(slot for slot in range(cap) if slot not in taken)
+                taken.add(entry["slot"])
 
 
 def normalize_datasets(items):
@@ -593,12 +718,25 @@ def normalize_datasets(items):
             }
         )
 
-    assign_chain_slots(entries)
+    assign_style_slots(entries)
 
     for entry, label in zip(entries, dataset_labels([e["path"] for e in entries])):
-        entry["label"]     = label
-        entry["color"]     = DATASET_COLORS[entry["slot"] % len(DATASET_COLORS)] if entry["slot"] is not None else None
-        entry["linestyle"] = DATASET_LINESTYLES[entry["slot"] // len(DATASET_COLORS)] if entry["slot"] is not None else None
+        entry["label"] = label
+        entry["color"] = DATASET_COLORS[entry["slot"] % len(DATASET_COLORS)]
+
+        ### The two kinds index the linestyle differently, because the two views
+        ### spend their color differently. A chain overlay colors by chain, so
+        ### the linestyle only has to break ties between chains that share a hue
+        ### (slot // 3). The n(z) overlay colors by *tracer*, leaving nothing but
+        ### the linestyle to identify the file -- so there it has to vary first
+        ### (slot % 3), in step with the color the same file carries in the
+        ### data-vector view.
+        if entry["kind"] == "sacc":
+            entry["linestyle"] = DATASET_LINESTYLES[entry["slot"] %  len(DATASET_LINESTYLES)]
+            entry["symbol"]    = DATASET_SYMBOLS[entry["slot"]    // len(DATASET_COLORS)]
+        else:
+            entry["linestyle"] = DATASET_LINESTYLES[entry["slot"] // len(DATASET_COLORS)]
+            entry["symbol"]    = None
 
     return entries
 
@@ -779,7 +917,10 @@ def make_chain_main_content(chains):
     ]
 
 
-@functools.lru_cache(maxsize = 8)
+### Sized so that every sacc file the app will let you load at once stays
+### resident: each figure callback now touches all of them, and reparsing a
+### 5 MB FITS file per overlaid dataset per interaction would be felt
+@functools.lru_cache(maxsize = MAX_OVERLAY_SACCS)
 def load_dataset_bundle(sacc_path):
     """ load_dataset_bundle
 
@@ -809,94 +950,184 @@ def load_dataset_bundle(sacc_path):
     return s, df, nz_df, data_types, tracers, has_cov
 
 
-def make_cov_tab_content(has_cov):
+def make_cov_tab_content(saccs):
     """ make_cov_tab_content
 
         Inputs:
-        - has_cov (bool)
+        - saccs (list of dict): sacc dataset entries, in load order
 
         Process:
-        - Builds the Covariance tab's children: the mode selector + graph if the
-        dataset has a covariance matrix, or an explanatory message if it doesn't
+        - Builds the Covariance tab's children: a file selector, the mode
+        selector and the graph -- or an explanatory message if not one of the
+        loaded files has a covariance matrix.
+        - Two heatmaps can't be overlaid the way two sets of points or two
+        curves can, so this is the one sacc view that shows a single file. The
+        selector is rendered even for a single loaded file (hidden), so the
+        callback below always has its Input present in the layout.
 
         Outputs:
         - children (list of Dash components)
     """
-    return (
-        [
-            dcc.RadioItems(
-                id      = "cov-mode",
-                options = [
-                    {"label": "Correlation", "value": "correlation"},
-                    {"label": "Covariance (signed log10)", "value": "covariance"},
-                    {"label": "Precision (inverse covariance)", "value": "precision"},
-                ],
-                value  = "correlation",
-                inline = True,
-                style  = {"marginTop": "10px"},
-            ),
-            dcc.Graph(id = "cov-graph"),
-        ]
-        if has_cov
-        else [html.P("No covariance matrix present in this sacc file.")]
-    )
+    with_cov = [d for d in saccs if load_dataset_bundle(d["path"])[5]]
 
-
-def make_sacc_main_content(sacc_path):
-    """ make_sacc_main_content
-
-        Inputs:
-        - sacc_path (str): path to a .sacc file
-
-        Process:
-        - Builds the main-content children for a loaded sacc dataset: the
-        info panel and the Data vector / n(z) / Covariance tabs
-
-        Outputs:
-        - children (list of Dash components)
-    """
-    _, df, _, data_types, tracers, has_cov = load_dataset_bundle(sacc_path)
+    if not with_cov:
+        return [html.P("No covariance matrix present in the loaded sacc file(s).")]
 
     return [
         html.Div(
             [
-                html.H4(f"From file: {sacc_path}"),
-                html.P(f"Found {len(df)} data points, {len(tracers)} tracers, covariance: {has_cov}"),
+                html.Span("Covariance from: ", style = {"marginRight": "6px"}),
+                dcc.Dropdown(
+                    id        = "cov-dataset",
+                    options   = [{"label": d["label"], "value": d["path"]} for d in with_cov],
+                    value     = with_cov[0]["path"],
+                    clearable = False,
+                    style     = {"width": "500px", "display": "inline-block", "verticalAlign": "middle"},
+                ),
+            ],
+            style = {"marginTop": "10px"} if len(saccs) > 1 else {"display": "none"},
+        ),
+        dcc.RadioItems(
+            id      = "cov-mode",
+            options = [
+                {"label": "Correlation", "value": "correlation"},
+                {"label": "Covariance (signed log10)", "value": "covariance"},
+                {"label": "Precision (inverse covariance)", "value": "precision"},
+            ],
+            value  = "correlation",
+            inline = True,
+            style  = {"marginTop": "10px"},
+        ),
+        dcc.Graph(id = "cov-graph"),
+    ]
+
+
+def shared_sacc_contents(saccs):
+    """ shared_sacc_contents
+
+        Inputs:
+        - saccs (list of dict): sacc dataset entries, in load order
+
+        Process:
+        - Takes the union of the data types and of the tracers across the loaded
+        files, and records which files are missing each one. Unlike a chain
+        parameter -- which getdist would silently drop from one chain, quietly
+        comparing different parameter sets -- a data type or tracer that only
+        some files have is harmless to offer: the overlay simply draws fewer
+        datasets. So these stay selectable, and the option is annotated with
+        who is missing instead of being disabled.
+
+        Outputs:
+        - data_types (list of str), in first-seen order
+        - tracers (list of str), natural-sorted
+        - missing (dict): data type or tracer -> labels of the files lacking it
+    """
+    bundles = [load_dataset_bundle(d["path"]) for d in saccs]
+
+    data_types = list(dict.fromkeys(dt for bundle in bundles for dt in bundle[3]))
+    tracers    = sorted({t for bundle in bundles for t in bundle[4]}, key = natural_key)
+
+    missing = {}
+    for name, index in [(dt, 3) for dt in data_types] + [(t, 4) for t in tracers]:
+        absent = [d["label"] for d, bundle in zip(saccs, bundles) if name not in bundle[index]]
+        if absent:
+            missing[name] = absent
+
+    return data_types, tracers, missing
+
+
+def option_label(name, missing, pretty = None):
+    """ option_label
+
+        Inputs:
+        - name (str): the data type or tracer the option selects
+        - missing (dict): output of shared_sacc_contents
+        - pretty (str or None): display name, if it differs from `name`
+
+        Outputs:
+        - the option's label, annotated with which files lack it
+    """
+    text = pretty or name
+    return f"{text} (not in {', '.join(missing[name])})" if name in missing else text
+
+
+def make_sacc_main_content(saccs):
+    """ make_sacc_main_content
+
+        Inputs:
+        - saccs (list of dict): sacc dataset entries, in load order
+
+        Process:
+        - Builds the main-content children for the loaded sacc datasets: a
+        summary line per file, and the Data vector / n(z) / Covariance tabs.
+        - The data-type dropdown and the tracer checklist offer the union over
+        the loaded files, so a file with an extra data type or an extra
+        redshift bin doesn't vanish from the controls.
+
+        Outputs:
+        - children (list of Dash components)
+    """
+    data_types, tracers, missing = shared_sacc_contents(saccs)
+
+    summary = []
+    for entry in saccs:
+        _, df, _, _, file_tracers, has_cov = load_dataset_bundle(entry["path"])
+        summary.append(
+            html.P(
+                [
+                    html.Span(entry["label"], style = {"fontWeight": "600"}),
+                    html.Span(
+                        f" -- {len(df)} data points, {len(file_tracers)} tracers, "
+                        f"covariance: {has_cov} -- {entry['path']}",
+                    ),
+                ],
+                style = {"margin": "2px 0"},
+            )
+        )
+
+    return [
+        html.Div(
+            [
+                html.H4(f"{len(saccs)} sacc file{'s' if len(saccs) != 1 else ''} loaded"),
+                *summary,
             ],
         ),
         dcc.Tabs(
             [
                 dcc.Tab(
-                    label="Data vector",
-                    children=[
+                    label    = "Data vector",
+                    children = [
                         dcc.Dropdown(
-                            id="data-type-dropdown",
-                            options=[{"label": data_type_label(dt), "value": dt} for dt in data_types],
-                            value=data_types[0] if data_types else None,
-                            clearable=False,
-                            style={"width": "500px", "marginTop": "10px"},
+                            id        = "data-type-dropdown",
+                            options   = [
+                                {"label": option_label(dt, missing, data_type_label(dt)), "value": dt}
+                                for dt in data_types
+                            ],
+                            value     = data_types[0] if data_types else None,
+                            clearable = False,
+                            style     = {"width": "500px", "marginTop": "10px"},
                         ),
-                        dcc.Graph(id="data-vector-graph"),
+                        dcc.Graph(id = "data-vector-graph"),
                     ],
                 ),
                 dcc.Tab(
-                    label="n(z)",
-                    children=[
+                    label    = "n(z)",
+                    children = [
                         dcc.Checklist(
-                            id="tracer-checklist",
-                            options=[{"label": t, "value": t} for t in tracers],
-                            value=tracers,
-                            inline=True,
-                            style={"marginTop": "10px"},
+                            id      = "tracer-checklist",
+                            options = [{"label": option_label(t, missing), "value": t} for t in tracers],
+                            value   = tracers,
+                            inline  = True,
+                            style   = {"marginTop": "10px"},
                         ),
-                        dcc.Graph(id="nz-graph"),
+                        dcc.Graph(id = "nz-graph"),
                     ],
                 ),
                 dcc.Tab(
                     label    = "Covariance",
                     children = html.Div(
                         id       = "cov-tab-content",
-                        children = make_cov_tab_content(has_cov),
+                        children = make_cov_tab_content(saccs),
                     ),
                 ),
             ]
@@ -911,10 +1142,11 @@ def make_dataset_panel(datasets):
         - datasets (list of dict): dataset entries
 
         Process:
-        - Lists the loaded datasets with a Remove button each. Chains also show
-        the color and linestyle they are drawn with, so the panel doubles as a
-        legend for the overlay -- and, since it names every chain in text, chain
-        identity never rests on color alone.
+        - Lists the loaded datasets with a Remove button each, showing the color
+        and second style channel each is drawn with -- linestyle for a chain,
+        marker symbol for a sacc file -- so the panel doubles as a legend for
+        both overlays. Since it names every dataset in text, identity never
+        rests on color alone.
 
         Outputs:
         - children (list of Dash components)
@@ -925,9 +1157,16 @@ def make_dataset_panel(datasets):
     rows = []
     for i, d in enumerate(datasets):
 
-        ### Chains get a color swatch; nothing in the sacc view is keyed by
-        ### dataset color yet, so a sacc entry would only imply a meaning it
-        ### doesn't have
+        ### A sacc file carries both channels -- the symbol in the data-vector
+        ### view, the linestyle in n(z) -- so the panel names both. (The
+        ### covariance view is the one place a sacc file isn't drawn in its own
+        ### color; it names the file in its title instead.)
+        channel = (
+            f"{LINESTYLE_NAMES[d['linestyle']]} {SYMBOL_NAMES[d['symbol']]}"
+            if d["kind"] == "sacc"
+            else LINESTYLE_NAMES[d["linestyle"]]
+        )
+
         swatch = [
             html.Span(
                 style = {
@@ -941,10 +1180,10 @@ def make_dataset_panel(datasets):
                 },
             ),
             html.Span(
-                f"{LINESTYLE_NAMES[d['linestyle']]}, ",
+                f"{channel}, ",
                 style = {"color": "#898781"},
             ),
-        ] if d["kind"] == "chain" else []
+        ]
 
         rows.append(
             html.Div(
@@ -975,11 +1214,9 @@ def make_main_content(datasets):
 
         Process:
         - Builds the main-content children for whatever is loaded: one section
-        overplotting every loaded chain, and/or one section for a sacc file.
-        Both can be present at once, so a mixed set of datasets degrades to two
-        stacked sections rather than an error.
-        - Sacc files are still shown one at a time (the first one loaded);
-        overplotting data vectors is the next piece of work.
+        overplotting every loaded chain, and one overplotting every loaded sacc
+        file. Both can be present at once, so a mixed set of datasets degrades
+        to two stacked sections rather than an error.
 
         Outputs:
         - children (list of Dash components)
@@ -998,15 +1235,7 @@ def make_main_content(datasets):
     if saccs:
         if chains:
             children.append(html.Hr())
-        if len(saccs) > 1:
-            children.append(
-                html.P(
-                    f"{len(saccs)} sacc files are loaded, but only {saccs[0]['label']} is shown -- "
-                    f"overplotting data vectors isn't implemented yet.",
-                    style = {"color": "crimson"},
-                )
-            )
-        children += make_sacc_main_content(saccs[0]["path"])
+        children += make_sacc_main_content(saccs)
 
     return children
 
@@ -1111,8 +1340,8 @@ def build_app(initial_datasets=None):
         saccs = datasets_of_kind(datasets, "sacc")
         if not saccs or not data_type:
             return go.Figure()
-        _, df, _, _, _, _ = load_dataset_bundle(saccs[0]["path"])
-        return make_data_vector_figure(df, data_type)
+        frames = [load_dataset_bundle(d["path"])[1] for d in saccs]
+        return make_data_vector_figure(saccs, frames, data_type)
 
     @app.callback(
         Output("nz-graph", "figure"),
@@ -1123,22 +1352,29 @@ def build_app(initial_datasets=None):
         saccs = datasets_of_kind(datasets, "sacc")
         if not saccs:
             return go.Figure()
-        _, _, nz_df, _, _, _ = load_dataset_bundle(saccs[0]["path"])
-        return make_nz_figure(nz_df, selected_tracers or [])
+        nz_frames = [load_dataset_bundle(d["path"])[2] for d in saccs]
+        return make_nz_figure(saccs, nz_frames, selected_tracers or [])
 
     @app.callback(
         Output("cov-graph", "figure"),
         Input("cov-mode", "value"),
+        Input("cov-dataset", "value"),
         Input("dataset-store", "data"),
     )
-    def update_cov(mode, datasets):
+    def update_cov(mode, cov_path, datasets):
         saccs = datasets_of_kind(datasets, "sacc")
         if not saccs:
             return go.Figure()
-        s, df, _, _, _, has_cov = load_dataset_bundle(saccs[0]["path"])
+
+        ### The selector is rebuilt whenever the store changes, so a removal can
+        ### leave this callback holding a path that is no longer loaded -- fall
+        ### back to the first loaded file rather than reading a stale one
+        entry = next((d for d in saccs if d["path"] == cov_path), saccs[0])
+
+        s, df, _, _, _, has_cov = load_dataset_bundle(entry["path"])
         if not has_cov:
-            return dash.no_update
-        return make_covariance_figure(s, df, mode)
+            return message_figure(f"No covariance matrix present in {entry['label']}.")
+        return make_covariance_figure(s, df, mode, label = entry["label"] if len(saccs) > 1 else None)
 
     @app.callback(
         Output("chain-graph", "src"),
@@ -1237,8 +1473,8 @@ def add_dataset(datasets, path, origin):
 
         Process:
         - Appends the dataset, refusing duplicates and refusing to exceed
-        MAX_OVERLAY_CHAINS chains (past that there are no unique
-        (color, linestyle) pairs left to tell them apart with)
+        MAX_OVERLAY[kind] datasets of that kind (past that there are no unique
+        (color, linestyle/symbol) pairs left to tell them apart with)
 
         Outputs:
         - datasets (list of dict) or dash.no_update
@@ -1248,9 +1484,9 @@ def add_dataset(datasets, path, origin):
         return dash.no_update, f"{os.path.basename(path)} is already loaded."
 
     kind = dataset_kind(path)
-    if kind == "chain" and len(datasets_of_kind(datasets, "chain")) >= MAX_OVERLAY_CHAINS:
+    if len(datasets_of_kind(datasets, kind)) >= MAX_OVERLAY[kind]:
         return dash.no_update, (
-            f"Already overplotting {MAX_OVERLAY_CHAINS} chains, which is as many as can be "
+            f"Already overplotting {MAX_OVERLAY[kind]} {kind} datasets, which is as many as can be "
             f"told apart -- remove one first."
         )
 
@@ -1353,12 +1589,13 @@ def main():
             parser.error(f"--registry-id {dataset_id} lookup failed: {e}")
         initial_datasets.append({"path": path, "origin": f"registry:{dataset_id}"})
 
-    chains = [d for d in initial_datasets if dataset_kind(d["path"]) == "chain"]
-    if len(chains) > MAX_OVERLAY_CHAINS:
-        parser.error(
-            f"{len(chains)} chains given, but at most {MAX_OVERLAY_CHAINS} can be overplotted "
-            f"distinguishably (one per color/linestyle pair)"
-        )
+    for kind, cap in MAX_OVERLAY.items():
+        given = [d for d in initial_datasets if dataset_kind(d["path"]) == kind]
+        if len(given) > cap:
+            parser.error(
+                f"{len(given)} {kind} datasets given, but at most {cap} can be overplotted "
+                f"distinguishably (one per color/linestyle pair)"
+            )
 
     app = build_app(initial_datasets)
     try:
