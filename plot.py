@@ -36,10 +36,11 @@ import sacc
 import matplotlib
 matplotlib.use("Agg")
 
-### Jessie Muir's chain-plotting utility lives outside this repo, in her own
-### NERSC directory -- not yet vendored in or made configurable, so this will
-### need revisiting before this app can run anywhere other than NERSC (e.g. Spin)
-CHAINPLOT_UTILS_DIR = "./Muir_plottingFiles"
+### Jessie Muir's chain-plotting utility is vendored into Muir_plottingFiles/
+### (see its readme.md). Resolve it relative to this file rather than the
+### working directory, so the app can be launched from anywhere. It reads
+### Y6METHODSDIR at import time, so that has to be set before the import.
+CHAINPLOT_UTILS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Muir_plottingFiles")
 os.environ["Y6METHODSDIR"] = CHAINPLOT_UTILS_DIR
 sys.path.insert(0, CHAINPLOT_UTILS_DIR)
 from getdist_chainplot_utils import get_paramdict, make_chainplot
@@ -469,16 +470,24 @@ def make_chain_figure(chain_path, params):
         Outputs:
         - data URI (str) suitable for an html.Img's src
     """
+    ### With one parameter selected, make_chainplot draws a 1D posterior -- and
+    ### that branch indexes param_limits by parameter name (line 2038) before the
+    ### None check further down, so the default None raises TypeError. Passing an
+    ### explicit "no limits for this parameter" entry avoids patching her file.
+    ### The triangle branch (2+ parameters) handles None itself, so leave it.
+    param_limits = {params[0]: None} if len(params) == 1 else None
+
     with tempfile.TemporaryDirectory() as tmpdir:
         make_chainplot(
-            inputflist = [chain_path],
-            indatdir   = "",
-            params     = params,
-            outname    = "chain_plot",
-            inlabels   = [os.path.basename(chain_path)],
-            outdir     = tmpdir,
-            ftype      = "png",
-            clearfig   = True,
+            inputflist   = [chain_path],
+            indatdir     = "",
+            params       = params,
+            outname      = "chain_plot",
+            inlabels     = [os.path.basename(chain_path)],
+            param_limits = param_limits,
+            outdir       = tmpdir,
+            ftype        = "png",
+            clearfig     = True,
         )
         with open(os.path.join(tmpdir, "chain_plot.png"), "rb") as f:
             encoded = base64.b64encode(f.read()).decode("ascii")

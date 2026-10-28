@@ -47,10 +47,11 @@ import sacc
 import matplotlib
 matplotlib.use("Agg")
 
-### Jessie Muir's chain-plotting utility lives outside this repo, in her own
-### NERSC directory -- not yet vendored in or made configurable, so this will
-### need revisiting before this app can run anywhere other than NERSC (e.g. Spin)
-CHAINPLOT_UTILS_DIR = "./Muir_plottingFiles"
+### Jessie Muir's chain-plotting utility is vendored into Muir_plottingFiles/
+### (see its readme.md). Resolve it relative to this file rather than the
+### working directory, so the app can be launched from anywhere. It reads
+### Y6METHODSDIR at import time, so that has to be set before the import.
+CHAINPLOT_UTILS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Muir_plottingFiles")
 os.environ["Y6METHODSDIR"] = CHAINPLOT_UTILS_DIR
 sys.path.insert(0, CHAINPLOT_UTILS_DIR)
 from getdist_chainplot_utils import get_paramdict, make_chainplot
