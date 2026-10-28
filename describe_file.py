@@ -25,10 +25,17 @@ PLANNED = "new loader needed"     # plottable, DEED doesn't read it yet
 DISPLAY_ONLY = "display only"     # already a finished picture or a table of values
 NOT_PLOTTABLE = "not plottable"   # nothing to plot, or unsafe to open
 
-### A qp ensemble with at most this many rows is treated as a tomographic n(z)
-### stack (TXPipe QPNOfZFile: one row per bin plus a final 2D row) rather than a
-### catalog of per-object photo-z PDFs, which has one row per galaxy
+### A redshift-like qp ensemble with at most this many rows is treated as a
+### tomographic n(z) stack (TXPipe QPNOfZFile: one row per bin plus a final 2D
+### row) rather than a catalog of per-object photo-z PDFs, one row per galaxy
 MAX_NZ_ROWS = 50
+
+### qp holds any 1D distribution and records nothing about what x is, so a qp
+### file is only called redshift when something points that way: an ancil column
+### RAIL / LePhare / TXPipe use for photo-z point estimates (compared lowercase)...
+PHOTOZ_ANCIL_COLUMNS = {"zmode", "zmean", "zmedian", "z_best", "zq_best", "zb", "z_mode", "z_mean", "z_median"}
+### ...or a grid starting at zero and ending where a redshift grid would
+REDSHIFT_GRID_MAX = (1.0, 10.0)
 
 MAGIC = {
     b"\x89HDF\r\n\x1a\n": "hdf5",
@@ -284,6 +291,28 @@ def _h5_columns(group):
     return cols, rows
 
 
+def _redshift_evidence(grid, ancil):
+    """ _redshift_evidence
+
+        Inputs:
+        - grid (np.ndarray or None): the ensemble's x grid (meta xvals / bins), if it has one
+        - ancil (list of str): the ensemble's ancil column names
+
+        Process:
+        - Collects the reasons, if any, to read this ensemble's x as redshift
+
+        Outputs:
+        - list of str, empty when nothing points to redshift
+    """
+    evidence = []
+    photoz_cols = [c for c in ancil if c.lower() in PHOTOZ_ANCIL_COLUMNS]
+    if photoz_cols:
+        evidence.append(f"photo-z point-estimate columns in ancil: {photoz_cols}")
+    if grid is not None and grid.size and abs(grid.min()) < 1e-6 and REDSHIFT_GRID_MAX[0] <= grid.max() <= REDSHIFT_GRID_MAX[1]:
+        evidence.append(f"x grid spans {grid.min():.3g}-{grid.max():.3g}, a typical redshift range")
+    return evidence
+
+
 def _describe_qp(path, f):
     """ _describe_qp
 
@@ -292,8 +321,11 @@ def _describe_qp(path, f):
         - f (h5py.File): open file with qp's meta / data layout
 
         Process:
-        - Reads the parameterization (pdf_name) and the number of rows. A short
-        ensemble is a tomographic n(z) stack; a long one is per-object PDFs
+        - Reads the parameterization (pdf_name), the number of rows, the grid and
+        the ancil columns. qp can hold any 1D distribution, so the ensemble is
+        described generically unless _redshift_evidence finds a reason to read it
+        as photo-z. If it does, a short ensemble is a tomographic n(z) stack and a
+        long one is per-object PDFs
 
         Outputs:
         - FileDescription
@@ -306,8 +338,30 @@ def _describe_qp(path, f):
     grid = meta[grid_key][()].squeeze() if grid_key else None
     grid_text = f", on a grid of {grid.size} points from {grid.min():.3g} to {grid.max():.3g}" if grid is not None and grid.size else ""
     ancil = list(f["ancil"].keys()) if "ancil" in f else []
-    details = {"pdf_type": pdf_name, "n_pdfs": n_rows, "data_columns": data_cols, "ancil_columns": ancil}
+    evidence = _redshift_evidence(grid, ancil)
+    details = {"pdf_type": pdf_name, "n_pdfs": n_rows, "data_columns": data_cols, "ancil_columns": ancil,
+               "redshift_evidence": evidence}
 
+    if not evidence:
+        n_text = f"{n_rows:,}" if n_rows is not None else "An unknown number of"
+        return FileDescription(
+            path = path,
+            file_type = "qp ensemble (HDF5) -- 1D PDFs",
+            represents = (
+                f"{n_text} one-dimensional PDFs of type '{pdf_name}'{grid_text}, stored as {data_cols}. "
+                "qp can hold any 1D distribution and records no name or units for the variable, so "
+                "nothing here says what x is -- nothing points to redshift."
+                + (f" Extra per-PDF columns: {ancil}." if ancil else "")
+            ),
+            plotting = (
+                "Evaluate with qp.read(...).pdf(x) on a grid: the stored xvals / bins / knots where the "
+                "type has them, otherwise a range from .ppf (e.g. 0.1%-99.9%). Few rows: overlay every "
+                "row. Many rows: a sample of rows plus their mean. Label the axes generically (x, p(x)) "
+                "unless the user names the variable."
+            ),
+            deed_support = PLANNED,
+            details = details,
+        )
     if n_rows is not None and n_rows <= MAX_NZ_ROWS:
         return FileDescription(
             path = path,
@@ -315,7 +369,8 @@ def _describe_qp(path, f):
             represents = (
                 f"Redshift distributions: {n_rows} n(z) curves of type '{pdf_name}'{grid_text}. "
                 "In TXPipe's QPNOfZFile (photoz_stack, lens_photoz_stack, shear_photoz_stack) each "
-                "row is one tomographic bin, and the last row is the 2D (non-tomographic) n(z)."
+                "row is one tomographic bin, and the last row is the 2D (non-tomographic) n(z). "
+                f"Read as redshift because of: {'; '.join(evidence)}."
             ),
             plotting = (
                 "Fits DEED's existing n(z) view: one curve per bin, colored like the sacc n(z) tab, "
@@ -332,6 +387,7 @@ def _describe_qp(path, f):
             f"Photo-z PDFs for {n_rows:,} objects, of type '{pdf_name}'{grid_text}. "
             "These come from RAIL estimators (QPHandle) or TXPipe's QPPDFFile (photoz_pdfs)."
             + (f" Point estimates / extra columns: {ancil}." if ancil else "")
+            + f" Read as redshift because of: {'; '.join(evidence)}."
         ),
         plotting = (
             "Per-object view: a handful of example p(z) curves picked by index or at random. "
