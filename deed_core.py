@@ -110,8 +110,7 @@ pio.templates.default = "plotly+source_sans"
 ### matching theme. Backgrounds are transparent in both, so a figure takes the
 ### color of the card it sits in rather than painting its own rectangle over it;
 ### the dark template's text and gridlines are light enough to read on Bootstrap's
-### dark body color (#212529). THEME_INK is the color for lines drawn on top of
-### data -- e.g. the covariance block boundaries -- which have to flip too.
+### dark body color (#212529). THEME_INK is the text color of each theme.
 THEMES    = ("light", "dark")
 THEME_INK = {"light": "#212529", "dark": "#dee2e6"}
 
@@ -568,7 +567,7 @@ def apply_theme(fig, theme):
     return fig
 
 
-def make_covariance_figure(s, df, mode, label = None, theme = "light"):
+def make_covariance_figure(s, df, mode, label = None):
     """ make_covariance_figure
 
         Inputs:
@@ -577,7 +576,6 @@ def make_covariance_figure(s, df, mode, label = None, theme = "light"):
         - mode (str), one of "correlation", "covariance", "precision"
         - label (str or None): the dataset label, named in the title when
         several sacc files are loaded and this is one of them
-        - theme (str): "light" or "dark", for the color of the block boundaries
 
         Process:
         - Builds the requested matrix representation of the covariance. One file
@@ -651,8 +649,10 @@ def make_covariance_figure(s, df, mode, label = None, theme = "light"):
 
     boundaries = df["data_type"].ne(df["data_type"].shift()).to_numpy().nonzero()[0]
     for b in boundaries[1:]:
-        fig.add_vline(x = b - 0.5, line = dict(color = THEME_INK[theme], width = 1))
-        fig.add_hline(y = b - 0.5, line = dict(color = THEME_INK[theme], width = 1))
+        ### Drawn on the heatmap, which is mostly white in either theme, so the
+        ### boundaries stay dark even on a dark page
+        fig.add_vline(x = b - 0.5, line = dict(color = THEME_INK["light"], width = 1))
+        fig.add_hline(y = b - 0.5, line = dict(color = THEME_INK["light"], width = 1))
 
     return fig
 
@@ -1229,6 +1229,10 @@ def search_registry(name = None, owner = None, extension = None):
         filters.append(query.gen_filter("dataset.relative_path", "~=", f"*{extension}"))
 
     df = query.find_datasets(REGISTRY_COLUMNS, filters, return_format = "dataframe", strip_table_names = True)
+
+    ### No match comes back as a DataFrame without any columns at all
+    if df.empty:
+        return pd.DataFrame(columns = [c.split(".", 1)[1] for c in REGISTRY_COLUMNS])
     return df.sort_values("dataset_id", ascending = False).head(REGISTRY_MAX_ROWS).reset_index(drop = True)
 
 
