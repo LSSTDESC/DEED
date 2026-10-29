@@ -53,7 +53,7 @@ def settle(page, timeout_ms = 20000):
     page.wait_for_load_state("networkidle")
     page.wait_for_function("() => !document.querySelector('[data-dash-is-loading=\"true\"]')", timeout = timeout_ms)
     page.wait_for_function(
-        "() => { const img = document.querySelector('.deed-chain-img'); return !img || (img.src && img.src.startsWith('data:image')); }",
+        "() => { const img = document.querySelector('.deed-chain-img'); return !img || img.offsetParent === null || (img.src && img.src.startsWith('data:image')); }",
         timeout = timeout_ms,
     )
     page.wait_for_timeout(800)

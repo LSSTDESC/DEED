@@ -7,26 +7,34 @@ overlays every loaded dataset, /explore shows one -- so the view builders and
 their callbacks are parametrized by an id prefix ("cmp", "exp") and by which
 loaded datasets the view draws.
 """
+import re
+
 import dash
 import dash_bootstrap_components as dbc
 import plotly.graph_objects as go
 from dash import dcc, html
-from dash.dependencies import Input, Output
+from dash.dependencies import Input, Output, State
 
 from deed_core import (
+    CHAIN_PARAMS_WARN,
     DEFAULT_CHAIN_PARAMS,
     LINESTYLE_NAMES,
     SYMBOL_NAMES,
     apply_theme,
+    chain_pair_stats,
+    chain_param_stats,
     data_type_label,
     datasets_of_kind,
     load_dataset_bundle,
     make_chain_figure,
     make_covariance_figure,
     make_data_vector_figure,
+    make_interactive_chain_figure,
     make_nz_figure,
     message_figure,
     option_label,
+    param_label,
+    param_pairs,
     shared_chain_params,
     shared_sacc_contents,
 )
@@ -327,8 +335,12 @@ def make_chain_view(chains, prefix, with_summary = False):
         Process:
         - A checklist of the parameters every chain has (parameters only some
         chains have are listed but disabled, naming who lacks them -- getdist
-        would otherwise silently drop them from one chain) and the getdist
-        image, filled by the callback.
+        would otherwise silently drop them from one chain).
+        - The plot, either interactive (Plotly, drawn from getdist's densities:
+        hover for statistics, click a panel to pin them) or the static getdist
+        PNG, chosen with a switch; a reference-chain selector for FoM ratios
+        (hidden with one chain); the pinned-statistics card; and a table of
+        every parameter pair's figure of merit per chain.
 
         Outputs:
         - children (list of components)
@@ -358,14 +370,179 @@ def make_chain_view(chains, prefix, with_summary = False):
             ],
             className = "deed-controls deed-param-list",
         ),
+        dbc.Row(
+            [
+                dbc.Col(
+                    [
+                        dbc.Label("Plot", className = "small mb-1"),
+                        dbc.RadioItems(
+                            id      = f"{prefix}-chain-mode",
+                            options = [{"label": "Interactive", "value": "interactive"},
+                                       {"label": "Static (getdist PNG)", "value": "static"}],
+                            value   = "interactive",
+                            inline  = True,
+                        ),
+                    ],
+                    md = "auto",
+                ),
+                dbc.Col(
+                    [
+                        dbc.Label("FoM reference", html_for = f"{prefix}-chain-ref", className = "small mb-1"),
+                        dbc.Select(
+                            id      = f"{prefix}-chain-ref",
+                            options = [{"label": d["label"], "value": d["path"]} for d in chains],
+                            value   = chains[0]["path"],
+                            size    = "sm",
+                        ),
+                    ],
+                    md        = 4,
+                    className = "" if len(chains) > 1 else "d-none",
+                ),
+            ],
+            className = "deed-controls g-3 align-items-end",
+        ),
+        html.Div(id = f"{prefix}-chain-warning"),
+        dcc.Store(id = f"{prefix}-chain-traces"),
+        dcc.Store(id = f"{prefix}-chain-pin"),
         dcc.Loading(
-            html.Div(html.Img(id = f"{prefix}-chain-img", className = "deed-chain-img"), className = "text-center"),
+            [
+                html.Div(
+                    html.Div(dcc.Graph(id = f"{prefix}-chain-graph", config = GRAPH_CONFIG), className = "deed-figure-scroll"),
+                    id = f"{prefix}-chain-graph-wrap",
+                ),
+                html.Div(
+                    html.Img(id = f"{prefix}-chain-img", className = "deed-chain-img"),
+                    id        = f"{prefix}-chain-img-wrap",
+                    className = "text-center d-none",
+                ),
+            ],
             type = "dot",
         ),
+        html.Div(id = f"{prefix}-chain-pinned", className = "mt-3"),
+        html.Div(id = f"{prefix}-chain-fom", className = "mt-3"),
     ]
     if with_summary:
         children.append(html.Div(id = f"{prefix}-chain-summary", className = "mt-3"))
     return children
+
+
+def label_component(label):
+    """ label_component
+
+        Inputs:
+        - label (str): a param_label, which may contain <sub> / <sup> tags
+
+        Outputs:
+        - Dash children rendering it (list of str / html.Sub / html.Sup), since a
+        Dash component can't take raw HTML
+    """
+    parts = []
+    for piece in re.split(r"(<su[bp]>.*?</su[bp]>)", label):
+        match = re.fullmatch(r"<(su[bp])>(.*?)</su[bp]>", piece)
+        if match:
+            parts.append((html.Sub if match.group(1) == "sub" else html.Sup)(match.group(2)))
+        elif piece:
+            parts.append(piece)
+    return parts
+
+
+def small_table(header, rows):
+    """ small_table
+
+        Inputs:
+        - header (list): column headings (str or components)
+        - rows (list of list): cells
+
+        Outputs:
+        - a compact, hoverable dbc.Table; columns after the first are right-aligned
+    """
+    return dbc.Table(
+        [
+            html.Thead(html.Tr([html.Th(h, className = "text-end" if k else "") for k, h in enumerate(header)])),
+            html.Tbody([html.Tr([html.Td(c, className = "text-end" if k else "") for k, c in enumerate(row)]) for row in rows]),
+        ],
+        size = "sm", hover = True, responsive = True, className = "mb-1",
+    )
+
+
+FOM_NOTE = "FoM = 1 / area of the pair's 68% ellipse (provisional definition)."
+
+
+def make_pinned_card(chains, tag, ref_path):
+    """ make_pinned_card
+
+        Inputs:
+        - chains (list of dict): the chains on the plot
+        - tag (list): the pinned panel -- [param] for a 1D panel, [param_x,
+        param_y] for a 2D one
+        - ref_path (str): the FoM reference chain
+
+        Outputs:
+        - card with every chain's statistics for that panel
+    """
+    if len(tag) == 1:
+        p = tag[0]
+        rows = []
+        for d in chains:
+            st = chain_param_stats(d["path"], p)
+            rows.append([html.Span([swatch(d), " ", d["label"]], className = "d-inline-flex align-items-center gap-1"),
+                         f"{st['mean']:.4g} ± {st['std']:.3g}", f"[{st['lo68']:.4g}, {st['hi68']:.4g}]", f"[{st['lo95']:.4g}, {st['hi95']:.4g}]"])
+        title  = ["Pinned: ", *label_component(param_label(p))]
+        header = ["Chain", "Mean ± std", "68%", "95%"]
+    else:
+        p_x, p_y = tag
+        ref_fom  = chain_pair_stats(ref_path, p_x, p_y)["fom"]
+        rows = []
+        for d in chains:
+            sx, sy = chain_param_stats(d["path"], p_x), chain_param_stats(d["path"], p_y)
+            pair   = chain_pair_stats(d["path"], p_x, p_y)
+            rows.append([html.Span([swatch(d), " ", d["label"]], className = "d-inline-flex align-items-center gap-1"),
+                         f"{sx['mean']:.4g} ± {sx['std']:.3g}", f"{sy['mean']:.4g} ± {sy['std']:.3g}", f"{pair['rho']:+.3f}",
+                         f"{pair['fom']:.4g}", "reference" if d["path"] == ref_path else f"×{pair['fom'] / ref_fom:.2f}"])
+        title  = ["Pinned: ", *label_component(param_label(p_x)), " – ", *label_component(param_label(p_y))]
+        header = ["Chain", label_component(param_label(p_x)), label_component(param_label(p_y)), "ρ", "FoM",
+                  "vs reference" if len(chains) > 1 else ""]
+    return card(title, [small_table(header, rows), html.Div(FOM_NOTE if len(tag) == 2 else "", className = "small text-body-secondary")],
+                className = "mb-0")
+
+
+def make_fom_table(chains, params, ref_path):
+    """ make_fom_table
+
+        Inputs:
+        - chains (list of dict), params (list of str), ref_path (str)
+
+        Process:
+        - One row per parameter pair (every pair of the selected parameters),
+        one column per chain: the pair's FoM, and with several chains its ratio
+        to the reference chain's. FoMs depend on the parametrization, so they
+        are only compared within a row.
+
+        Outputs:
+        - card (dbc.Card), or a hint when fewer than two parameters are selected
+    """
+    pairs = param_pairs(params)
+    if not pairs:
+        return html.Div("Select two or more parameters to see the figure of merit of each pair.", className = "small text-body-secondary")
+
+    rows = []
+    for p_x, p_y in pairs:
+        ref_fom = chain_pair_stats(ref_path, p_x, p_y)["fom"]
+        row = [[*label_component(param_label(p_x)), " – ", *label_component(param_label(p_y))]]
+        for d in chains:
+            fom = chain_pair_stats(d["path"], p_x, p_y)["fom"]
+            if len(chains) > 1 and d["path"] != ref_path:
+                row.append([f"{fom:.4g} ", html.Span(f"×{fom / ref_fom:.2f}", className = "text-body-secondary")])
+            else:
+                row.append(f"{fom:.4g}")
+        rows.append(row)
+    header = ["Pair"] + [
+        html.Span([swatch(d), " ", d["label"], " (ref)" if len(chains) > 1 and d["path"] == ref_path else ""],
+                  className = "d-inline-flex align-items-center gap-1")
+        for d in chains
+    ]
+    return card(f"Figure of merit, {len(pairs)} pair{'s' if len(pairs) != 1 else ''}",
+                [small_table(header, rows), html.Div(FOM_NOTE, className = "small text-body-secondary")], className = "mb-0")
 
 
 ### ------------------------------------------------------------- callbacks
@@ -438,14 +615,102 @@ def register_view_callbacks(prefix, select, extra_inputs = ()):
         label = entry["label"] if len(saccs) > 1 else None
         return apply_theme(make_covariance_figure(s, df, mode, label = label), theme)
 
+    def selected_chains_and_params(datasets, selected_params, extra):
+        ### The checklist reports parameters in click order; plot them in the
+        ### checklist's own order, so the triangle doesn't reshuffle
+        chains = datasets_of_kind(select(datasets, *extra), "chain")
+        shared = shared_chain_params(chains)[0] if chains else []
+        return chains, [p for p in shared if p in (selected_params or [])]
+
+    @dash.callback(
+        Output(f"{prefix}-chain-graph-wrap", "className"),
+        Output(f"{prefix}-chain-img-wrap", "className"),
+        Input(f"{prefix}-chain-mode", "value"),
+    )
+    def toggle_chain_mode(mode):
+        static = mode == "static"
+        return ("d-none" if static else ""), ("text-center" if static else "text-center d-none")
+
+    @dash.callback(
+        Output(f"{prefix}-chain-graph", "figure"),
+        Output(f"{prefix}-chain-traces", "data"),
+        Output(f"{prefix}-chain-warning", "children"),
+        Input(f"{prefix}-chain-params", "value"),
+        Input(f"{prefix}-chain-mode", "value"),
+        Input(f"{prefix}-chain-ref", "value"),
+        theme_input, store_input, *extra_inputs,
+    )
+    def update_chain_interactive(selected_params, mode, ref_path, dark, datasets, *extra):
+        theme = theme_of(dark)
+        chains, params = selected_chains_and_params(datasets, selected_params, extra)
+        if mode == "static" or not chains or not params:
+            return apply_theme(go.Figure(), theme), [], None
+        warning = None
+        if len(params) > CHAIN_PARAMS_WARN:
+            warning = dbc.Alert(
+                f"{len(params)} parameters make a {len(params) * (len(params) + 1) // 2}-panel triangle, which is slow "
+                f"to draw and hard to read; consider {CHAIN_PARAMS_WARN} or fewer.",
+                color = "warning", className = "py-2 small",
+            )
+        fig, trace_tags = make_interactive_chain_figure(chains, params, reference = ref_path)
+        return apply_theme(fig, theme), trace_tags, warning
+
+    ### The pin is held as the panel's parameters, not as a trace index, so it
+    ### can't go stale when the figure is redrawn with different traces; picking
+    ### other parameters or chains clears it
+    @dash.callback(
+        Output(f"{prefix}-chain-pin", "data"),
+        Input(f"{prefix}-chain-graph", "clickData"),
+        Input(f"{prefix}-chain-params", "value"),
+        store_input, *extra_inputs,
+        State(f"{prefix}-chain-traces", "data"),
+    )
+    def update_chain_pin(click, selected_params, datasets, *extra_and_traces):
+        trace_tags = extra_and_traces[-1]
+        if dash.callback_context.triggered_id != f"{prefix}-chain-graph" or not click or not trace_tags:
+            return None
+        curve = click["points"][0]["curveNumber"]
+        return trace_tags[curve] if 0 <= curve < len(trace_tags) else None
+
+    @dash.callback(
+        Output(f"{prefix}-chain-pinned", "children"),
+        Input(f"{prefix}-chain-pin", "data"),
+        Input(f"{prefix}-chain-ref", "value"),
+        store_input, *extra_inputs,
+        State(f"{prefix}-chain-params", "value"),
+    )
+    def update_chain_pinned(tag, ref_path, datasets, *extra_and_params):
+        chains, params = selected_chains_and_params(datasets, extra_and_params[-1], extra_and_params[:-1])
+        if not chains or not params:
+            return None
+        if not tag or any(p not in params for p in tag):
+            return html.Div("Click a panel of the interactive plot to pin its statistics here.", className = "small text-body-secondary")
+        ref_path = ref_path if any(d["path"] == ref_path for d in chains) else chains[0]["path"]
+        return make_pinned_card(chains, tag, ref_path)
+
+    @dash.callback(
+        Output(f"{prefix}-chain-fom", "children"),
+        Input(f"{prefix}-chain-params", "value"),
+        Input(f"{prefix}-chain-ref", "value"),
+        store_input, *extra_inputs,
+    )
+    def update_chain_fom(selected_params, ref_path, datasets, *extra):
+        chains, params = selected_chains_and_params(datasets, selected_params, extra)
+        if not chains or not params:
+            return None
+        ref_path = ref_path if any(d["path"] == ref_path for d in chains) else chains[0]["path"]
+        return make_fom_table(chains, params, ref_path)
+
     @dash.callback(
         Output(f"{prefix}-chain-img", "src"),
         Input(f"{prefix}-chain-params", "value"),
+        Input(f"{prefix}-chain-mode", "value"),
         theme_input, store_input, *extra_inputs,
     )
-    def update_chain(selected_params, dark, datasets, *extra):
+    def update_chain(selected_params, mode, dark, datasets, *extra):
         chains = datasets_of_kind(select(datasets, *extra), "chain")
-        if not chains or not selected_params:
+        ### The PNG takes a second or more, so it's only rendered when shown
+        if mode != "static" or not chains or not selected_params:
             return ""
         ### Tuples, because make_chain_figure is cached
         return make_chain_figure(

@@ -166,7 +166,7 @@ def update_explore_content(path, datasets):
             card(
                 "Posterior",
                 make_chain_view(chosen, "exp", with_summary = True),
-                subtitle = f"getdist plot of {os.path.basename(entry['path'])}; the table below uses the weighted samples directly.",
+                subtitle = f"getdist marginals of {os.path.basename(entry['path'])}: hover for statistics, click a panel to pin them.",
             )
         )
     return children
@@ -190,8 +190,8 @@ def update_chain_summary(params, path):
                 html.Td(html.Code(r["param"]), className = "small"),
                 html.Td(f"{r['mean']:.4g}", className = "text-end"),
                 html.Td(f"{r['std']:.3g}", className = "text-end"),
-                html.Td(f"{r['median']:.4g}", className = "text-end"),
                 html.Td(f"[{r['lo68']:.4g}, {r['hi68']:.4g}]", className = "text-end"),
+                html.Td(f"[{r['lo95']:.4g}, {r['hi95']:.4g}]", className = "text-end"),
             ]
         )
         for r in rows
@@ -200,13 +200,13 @@ def update_chain_summary(params, path):
         dbc.Table(
             [
                 html.Thead(html.Tr([html.Th("Parameter"), html.Th("Mean", className = "text-end"), html.Th("Std", className = "text-end"),
-                                    html.Th("Median", className = "text-end"), html.Th("68% interval", className = "text-end")])),
+                                    html.Th("68% interval", className = "text-end"), html.Th("95% interval", className = "text-end")])),
                 html.Tbody(body),
             ],
             size  = "sm",
             hover = True,
         ),
-        html.Div(f"Weighted samples, effective sample size ≈ {n_eff:,.0f}.", className = "small text-body-secondary"),
+        html.Div(f"getdist marginal statistics (as in the plot); effective sample size ≈ {n_eff:,.0f}.", className = "small text-body-secondary"),
     ]
 
 

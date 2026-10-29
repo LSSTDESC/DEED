@@ -76,7 +76,7 @@ def update_compare_content(datasets):
             card(
                 f"MCMC chains ({len(chains)})",
                 make_chain_view(chains, "cmp"),
-                subtitle = "Only parameters every chain has can be overplotted.",
+                subtitle = "Only parameters every chain has can be overplotted. Hover for statistics, click a panel to pin them.",
             )
         )
     if saccs:

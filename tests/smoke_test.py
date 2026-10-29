@@ -182,11 +182,61 @@ def test_app():
     for dark in (False, True):
         t0 = time.time()
         status, resp = post_callback(client, [("cmp-chain-img", "src")],
-                                     [("cmp-chain-params", "value", CHAIN_PARAMS), ("theme-switch", "value", dark), store])
+                                     [("cmp-chain-params", "value", CHAIN_PARAMS), ("cmp-chain-mode", "value", "static"),
+                                      ("theme-switch", "value", dark), store])
         uri = resp["response"]["cmp-chain-img"]["src"] if status == 200 else ""
         alpha = png_alpha_fraction(uri) if uri.startswith("data:image/png") else -1
         ok = alpha > 0.5 if dark else alpha == 0.0
         check(f"compare chains ({'dark' if dark else 'light'})", status == 200 and ok, f"transparent {alpha:.0%}, {time.time() - t0:.1f} s")
+
+    ### Interactive chains: figure + trace map, pin by click, FoM table
+    chains   = [d for d in datasets if d["kind"] == "chain"]
+    PARAMS3  = CHAIN_PARAMS + ["cosmological_parameters--h0"]
+    t0 = time.time()
+    status, resp = post_callback(
+        client, [("cmp-chain-graph", "figure"), ("cmp-chain-traces", "data"), ("cmp-chain-warning", "children")],
+        [("cmp-chain-params", "value", PARAMS3), ("cmp-chain-mode", "value", "interactive"),
+         ("cmp-chain-ref", "value", chains[1]["path"]), ("theme-switch", "value", True), store],
+    )
+    fig    = resp["response"]["cmp-chain-graph"]["figure"] if status == 200 else {}
+    traces = resp["response"]["cmp-chain-traces"]["data"] if status == 200 else []
+    fills  = [t for t in fig.get("data", []) if t.get("fill") == "toself"]
+    check("interactive chain figure", status == 200 and len(traces) == len(fig["data"]) and len(fills) >= 2 * 2 * 3,
+          f"{len(fig.get('data', []))} traces, {len(fills)} filled regions, {time.time() - t0:.1f} s")
+    check("hover text has FoM ratio to reference", any("×" in (t.get("text") or "") for t in fills))
+
+    pair_curve = next(k for k, tag in enumerate(traces) if len(tag) == 2)
+    status, resp = post_callback(client, [("cmp-chain-pin", "data")],
+                                 [("cmp-chain-graph", "clickData", {"points": [{"curveNumber": pair_curve}]}),
+                                  ("cmp-chain-params", "value", PARAMS3), store],
+                                 state = [("cmp-chain-traces", "data", traces)])
+    pin = resp["response"]["cmp-chain-pin"]["data"] if status == 200 else None
+    check("click pins a 2D panel", pin == traces[pair_curve] and len(pin) == 2, str(pin))
+
+    status, resp = post_callback(client, [("cmp-chain-pinned", "children")],
+                                 [("cmp-chain-pin", "data", pin), ("cmp-chain-ref", "value", chains[1]["path"]), store],
+                                 state = [("cmp-chain-params", "value", PARAMS3)])
+    check("pinned card shows rho and FoM", status == 200 and "FoM" in json.dumps(resp) and "reference" in json.dumps(resp))
+
+    status, resp = post_callback(client, [("cmp-chain-pin", "data")],
+                                 [("cmp-chain-graph", "clickData", {"points": [{"curveNumber": pair_curve}]}),
+                                  ("cmp-chain-params", "value", CHAIN_PARAMS), store],
+                                 state = [("cmp-chain-traces", "data", traces)], changed = ["cmp-chain-params.value"])
+    check("changing parameters clears the pin", status == 200 and resp["response"]["cmp-chain-pin"]["data"] is None)
+
+    status, resp = post_callback(client, [("cmp-chain-fom", "children")],
+                                 [("cmp-chain-params", "value", PARAMS3), ("cmp-chain-ref", "value", chains[0]["path"]), store])
+    body = json.dumps(resp)
+    check("FoM table: one row per pair", status == 200 and body.count('"Tr"') == 1 + 3 and "(ref)" in body)
+
+    import deed_core
+    many = sorted(deed_core.shared_chain_params(chains)[0])[:9]
+    status, resp = post_callback(
+        client, [("cmp-chain-graph", "figure"), ("cmp-chain-traces", "data"), ("cmp-chain-warning", "children")],
+        [("cmp-chain-params", "value", many), ("cmp-chain-mode", "value", "interactive"),
+         ("cmp-chain-ref", "value", chains[0]["path"]), ("theme-switch", "value", False), store],
+    )
+    check("more than 8 parameters warns", status == 200 and "slow" in json.dumps(resp["response"]["cmp-chain-warning"]))
 
     ### /explore
     status, resp = post_callback(client, [("exp-dataset", "options"), ("exp-dataset", "value")], [store], state = [("exp-dataset", "value", None)])
