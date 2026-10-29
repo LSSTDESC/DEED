@@ -10,7 +10,7 @@ Registry dataset_id, removed with x); the pages work on them:
 A switch in the navbar toggles light / dark mode for the page and every figure.
 
 Usage:
-    python app.py [--file path/to/a.sacc] [--file path/to/chain.txt] [--registry-id N] [--port 8050] [--debug]
+    python app.py [--file path/to/a.sacc] [--file path/to/chain.txt] [--registry-id N] [--host 127.0.0.1] [--port 8050] [--debug]
 
 --file and --registry-id are repeatable and can be mixed. For a production
 server (e.g. NERSC Spin), gunicorn serves the Flask object: gunicorn app:server
@@ -291,6 +291,9 @@ def main():
                         help = "dataset_id (in the working schema) to look up in the DESC Data Registry (repeatable)")
     parser.add_argument("--registry-config", default = None, help = "optional dataregistry config file (defaults to NERSC config resolution)")
     parser.add_argument("--port", type = int, default = 8050)
+    parser.add_argument("--host", default = "127.0.0.1",
+                        help = "interface to listen on (default 127.0.0.1, this machine only; pass it explicitly "
+                               "so Dash doesn't fall back on $HOST, which NERSC sets to the node's hostname)")
     parser.add_argument("--debug", action = "store_true",
                         help = "Dash debug mode: hot error reporting and the dev-tools toolbar (which covers part of the page)")
     args = parser.parse_args()
@@ -311,7 +314,7 @@ def main():
     try:
         ### use_reloader=False keeps this to one process, so kill_port below
         ### reliably runs on any exit path (see plot_many.py for the history)
-        app.run(debug = args.debug, port = args.port, use_reloader = False)
+        app.run(debug = args.debug, host = args.host, port = args.port, use_reloader = False)
     finally:
         kill_port(args.port)
 

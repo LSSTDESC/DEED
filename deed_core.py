@@ -16,6 +16,7 @@ import subprocess
 import sys
 import tempfile
 
+import contourpy
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
@@ -41,7 +42,7 @@ matplotlib.use("Agg")
 CHAINPLOT_UTILS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Muir_plottingFiles")
 os.environ["Y6METHODSDIR"] = CHAINPLOT_UTILS_DIR
 sys.path.insert(0, CHAINPLOT_UTILS_DIR)
-from getdist_chainplot_utils import get_paramdict, make_chainplot
+from getdist_chainplot_utils import DEFAULT_PLABELS, get_gdchain, get_paramdict, make_chainplot
 
 ### getdist_chainplot_utils sets rc('text', usetex=True) at import time, which
 ### requires a real LaTeX install to render any text at all -- not available in
@@ -864,20 +865,336 @@ def load_chain_samples(chain_path):
     return samples, weights, pdict
 
 
-def weighted_quantiles(values, weights, quantiles):
-    """ weighted_quantiles
+### --------------------------------------------------- interactive chain plots
+###
+### getdist computes, Plotly draws (deed_notes/interactive_chains_design.md):
+### each chain is read with Muir's get_gdchain -- the same smoothing and prior
+### ranges make_chainplot uses -- and its densities, contour levels and
+### marginal statistics are pulled out of getdist as arrays.
+
+### Probability contained by the inner and outer 2D contours, and by the
+### intervals quoted for 1D marginals -- getdist's own defaults
+CHAIN_CONTOURS = (0.68, 0.95)
+
+### Figure of merit for a parameter pair: 1 / area of the ellipse containing
+### FOM_CONTOUR of a 2D Gaussian with the pair's covariance C, whose area is
+### pi * (-2 ln(1 - FOM_CONTOUR)) * sqrt(det C).
+### PROVISIONAL (Leo, 2026-10-28): to be re-checked. Alternatives are the DETF
+### 1 / sqrt(det C) (same ratios between chains) and 1 / the area inside
+### getdist's smoothed 68% contour. Change pair_figure_of_merit, nothing else.
+FOM_CONTOUR = 0.68
+
+### Past this many parameters the Plotly triangle (n(n+1)/2 panels) gets slow to
+### draw and hard to read; the view warns rather than refusing
+CHAIN_PARAMS_WARN = 8
+
+GREEK = {
+    "alpha": "α", "beta": "β", "gamma": "γ", "delta": "δ", "epsilon": "ε", "eta": "η", "theta": "θ",
+    "kappa": "κ", "lambda": "λ", "mu": "μ", "nu": "ν", "xi": "ξ", "pi": "π", "rho": "ρ", "sigma": "σ",
+    "tau": "τ", "phi": "φ", "chi": "χ", "psi": "ψ", "omega": "ω", "Gamma": "Γ", "Delta": "Δ",
+    "Theta": "Θ", "Lambda": "Λ", "Sigma": "Σ", "Phi": "Φ", "Psi": "Ψ", "Omega": "Ω",
+}
+
+
+def latex_to_plotly(label):
+    r""" latex_to_plotly
 
         Inputs:
-        - values, weights (np.ndarray): samples and their weights
-        - quantiles (sequence of float), in [0, 1]
+        - label (str): a getdist / Muir LaTeX label, e.g. "$\Omega_{\rm m}$"
+
+        Process:
+        - Turns the simple LaTeX used for parameter labels into the HTML subset
+        Plotly renders without MathJax (which isn't reliable in this
+        environment): Greek letters to Unicode, _{...} / ^{...} to <sub> / <sup>,
+        \rm / \mathrm dropped, braces and $ removed.
 
         Outputs:
-        - np.ndarray of the weighted quantiles, by interpolating the weighted CDF
+        - label (str) for Plotly axis titles and hover text
     """
-    order = np.argsort(values)
-    cdf   = np.cumsum(weights[order])
-    cdf   = (cdf - 0.5 * weights[order]) / cdf[-1]
-    return np.interp(quantiles, cdf, values[order])
+    text = label.strip("$ ")
+    text = re.sub(r"\\(?:rm|mathrm|text|textrm)\s*", "", text)
+    text = re.sub(r"\\([A-Za-z]+)", lambda m: GREEK.get(m.group(1), m.group(1)), text)
+    for marker, tag in (("_", "sub"), ("^", "sup")):
+        text = re.sub(re.escape(marker) + r"\{([^{}]*)\}", rf"<{tag}>\1</{tag}>", text)
+        text = re.sub(re.escape(marker) + r"(\w)", rf"<{tag}>\1</{tag}>", text)
+    return text.replace("{", "").replace("}", "").replace("\\", "")
+
+
+def param_label(param):
+    """ param_label
+
+        Inputs:
+        - param (str): a chain column name, e.g. "cosmological_parameters--omega_m"
+
+        Outputs:
+        - display label (str): Muir's label for it if she has one, converted for
+        Plotly; else the part after "--"
+    """
+    latex = DEFAULT_PLABELS.get(param)
+    return latex_to_plotly(latex) if latex else param.split("--")[-1]
+
+
+@functools.lru_cache(maxsize = 2 * MAX_OVERLAY_CHAINS)
+def load_gd_samples(chain_path):
+    """ load_gd_samples
+
+        Inputs:
+        - chain_path (str): path to a .txt MCMC chain file
+
+        Process:
+        - Reads every column of the chain into a getdist MCSamples with Muir's
+        get_gdchain, called as make_chainplot calls it (default kdesmooth, prior
+        ranges from the chain header). Cached by path: about 0.2 s per chain.
+
+        Outputs:
+        - getdist.MCSamples
+    """
+    return get_gdchain(chain_path, flabel = os.path.basename(chain_path))
+
+
+@functools.lru_cache(maxsize = 256)
+def chain_1d_density(chain_path, param):
+    """ chain_1d_density
+
+        Inputs:
+        - chain_path (str), param (str)
+
+        Outputs:
+        - x, P (np.ndarray): getdist's smoothed 1D marginal, peak-normalized to 1
+    """
+    density = load_gd_samples(chain_path).get1DDensity(param)
+    return np.asarray(density.x), np.asarray(density.P) / np.max(density.P)
+
+
+@functools.lru_cache(maxsize = 512)
+def chain_2d_contours(chain_path, param_x, param_y):
+    """ chain_2d_contours
+
+        Inputs:
+        - chain_path (str), param_x (str), param_y (str)
+
+        Process:
+        - getdist's smoothed 2D density on a grid, the levels enclosing
+        CHAIN_CONTOURS of the probability, and the outline(s) at each level, from
+        contourpy (already a matplotlib dependency). A level can have several
+        disjoint outlines (a multimodal posterior); open outlines that run into a
+        prior edge are closed along it by the fill.
+
+        Outputs:
+        - dict: contour fraction -> list of (x, y) arrays, one per outline
+    """
+    density = load_gd_samples(chain_path).get2DDensityGridData(param_x, param_y, get_density = True)
+    levels  = density.getContourLevels(CHAIN_CONTOURS)
+    gen     = contourpy.contour_generator(density.x, density.y, density.P)
+    return {
+        fraction: [(line[:, 0], line[:, 1]) for line in gen.lines(level) if len(line) > 2]
+        for fraction, level in zip(CHAIN_CONTOURS, levels)
+    }
+
+
+@functools.lru_cache(maxsize = 512)
+def chain_param_stats(chain_path, param):
+    """ chain_param_stats
+
+        Inputs:
+        - chain_path (str), param (str)
+
+        Outputs:
+        - dict: "mean", "std" and, per fraction in CHAIN_CONTOURS, the
+        two-tail interval ("lo68", "hi68", "lo95", "hi95") -- getdist's
+        marginal statistics, so they match the plotted curves
+    """
+    marge = load_gd_samples(chain_path).getMargeStats().parWithName(param)
+    stats = {"mean": float(marge.mean), "std": float(marge.err)}
+    for fraction, limit in zip(CHAIN_CONTOURS, marge.limits):
+        pct = round(100 * fraction)
+        stats[f"lo{pct}"], stats[f"hi{pct}"] = float(limit.lower), float(limit.upper)
+    return stats
+
+
+def pair_figure_of_merit(cov):
+    """ pair_figure_of_merit
+
+        Inputs:
+        - cov (2x2 np.ndarray): covariance of a parameter pair
+
+        Outputs:
+        - the pair's figure of merit (float): 1 / area of its FOM_CONTOUR ellipse.
+        PROVISIONAL -- see FOM_CONTOUR
+    """
+    area = np.pi * -2 * np.log(1 - FOM_CONTOUR) * np.sqrt(np.linalg.det(cov))
+    return 1 / area
+
+
+@functools.lru_cache(maxsize = 512)
+def chain_pair_stats(chain_path, param_x, param_y):
+    """ chain_pair_stats
+
+        Inputs:
+        - chain_path (str), param_x (str), param_y (str)
+
+        Outputs:
+        - dict: "rho" (correlation coefficient) and "fom" (pair_figure_of_merit)
+        from the weighted-sample covariance
+    """
+    cov = np.asarray(load_gd_samples(chain_path).cov([param_x, param_y]))
+    return {"rho": float(cov[0, 1] / np.sqrt(cov[0, 0] * cov[1, 1])), "fom": float(pair_figure_of_merit(cov))}
+
+
+def param_pairs(params):
+    """ param_pairs
+
+        Inputs:
+        - params (list of str), in display order
+
+        Outputs:
+        - list of (param_x, param_y): every pair, in triangle order (x before y)
+    """
+    return [(params[j], params[i]) for i in range(len(params)) for j in range(i)]
+
+
+def fom_ratio_text(fom, ref_fom):
+    """Ratio of an FoM to the reference chain's, as hover / table text."""
+    return f"×{fom / ref_fom:.2f} vs reference" if ref_fom else ""
+
+
+def hex_to_rgba(color, alpha):
+    """'#rrggbb' -> 'rgba(r,g,b,alpha)', for translucent contour fills."""
+    r, g, b = (int(color[i:i + 2], 16) for i in (1, 3, 5))
+    return f"rgba({r},{g},{b},{alpha})"
+
+
+def make_interactive_chain_figure(chains, params, reference = None):
+    """ make_interactive_chain_figure
+
+        Inputs:
+        - chains (list of dict): chain dataset entries, in load order (label,
+        color, linestyle as everywhere else)
+        - params (list of str): parameters to plot; must be in every chain (see
+        shared_chain_params)
+        - reference (str or None): path of the chain FoM ratios are quoted
+        against; None for the first chain
+
+        Process:
+        - A Plotly triangle plot of getdist's smoothed marginals: 1D curves on the
+        diagonal, filled 68% / 95% regions below it, each chain in its own color
+        and linestyle. Every curve and region carries hover text with its
+        statistics (mean ± std and intervals; for a pair also the correlation and
+        the figure of merit, with the ratio to the reference chain).
+        - Under each panel sits an invisible, clickable heatmap, so a click
+        anywhere in a panel -- not only on a curve -- reports which panel it was.
+        Click events on filled regions alone aren't reliable.
+        - Column x axes are shared, as are the y axes of each row's 2D panels, so
+        zooming one panel zooms its row and column.
+
+        Outputs:
+        - fig (plotly go.Figure)
+        - trace_panels (list): per trace, the panel it belongs to -- [param] on
+        the diagonal, [param_x, param_y] below it -- so a clickData's
+        curveNumber can be mapped back to a panel
+    """
+    n          = len(params)
+    ref_path   = reference if any(d["path"] == reference for d in chains) else chains[0]["path"]
+    labels     = {p: param_label(p) for p in params}
+    trace_tags = []
+
+    fig = make_subplots(rows = n, cols = n, shared_xaxes = True, horizontal_spacing = 0.02, vertical_spacing = 0.02)
+
+    ### Axis ranges: the union of every chain's 1D support, where the smoothed
+    ### marginal is above 0.1% of its peak
+    ranges = {}
+    for p in params:
+        lows, highs = [], []
+        for d in chains:
+            x, P = chain_1d_density(d["path"], p)
+            keep = x[P > 1e-3]
+            lows.append(keep.min()); highs.append(keep.max())
+        ranges[p] = [min(lows), max(highs)]
+
+    for i, p_y in enumerate(params):
+        for j, p_x in enumerate(params[:i + 1]):
+            row, col = i + 1, j + 1
+            on_diagonal = i == j
+
+            ### Clickable backdrop: transparent, no hover label of its own
+            x0, x1 = ranges[p_x]
+            y0, y1 = (0, 1.08) if on_diagonal else ranges[p_y]
+            fig.add_trace(
+                go.Heatmap(
+                    x = np.linspace(x0, x1, 12), y = np.linspace(y0, y1, 12), z = np.zeros((12, 12)),
+                    opacity = 0, showscale = False, hoverinfo = "none",
+                ),
+                row = row, col = col,
+            )
+            trace_tags.append([p_x] if on_diagonal else [p_x, p_y])
+
+            for slot, d in enumerate(chains):
+                if on_diagonal:
+                    x, P  = chain_1d_density(d["path"], p_x)
+                    stats = chain_param_stats(d["path"], p_x)
+                    text  = (
+                        f"<b>{d['label']}</b><br>{labels[p_x]} = {stats['mean']:.4g} ± {stats['std']:.3g}<br>"
+                        f"68%: [{stats['lo68']:.4g}, {stats['hi68']:.4g}]<br>95%: [{stats['lo95']:.4g}, {stats['hi95']:.4g}]"
+                    )
+                    fig.add_trace(
+                        go.Scatter(
+                            x = x, y = P, mode = "lines", name = d["label"], legendgroup = d["label"],
+                            showlegend = i == 0 and len(chains) > 1,
+                            line = dict(color = d["color"], dash = PLOTLY_DASHES[d["linestyle"]], width = 2),
+                            text = text, hoverinfo = "text", hoveron = "points",
+                        ),
+                        row = row, col = col,
+                    )
+                    trace_tags.append([p_x])
+                    continue
+
+                pair    = chain_pair_stats(d["path"], p_x, p_y)
+                ref_fom = chain_pair_stats(ref_path, p_x, p_y)["fom"] if d["path"] != ref_path else None
+                sx, sy  = chain_param_stats(d["path"], p_x), chain_param_stats(d["path"], p_y)
+                outlines = chain_2d_contours(d["path"], p_x, p_y)
+
+                ### Outer region first, so the inner one is drawn (and hovered) on top
+                for fraction, alpha in ((CHAIN_CONTOURS[1], 0.25), (CHAIN_CONTOURS[0], 0.55)):
+                    text = (
+                        f"<b>{d['label']}</b> -- {round(100 * fraction)}% region<br>"
+                        f"{labels[p_x]} = {sx['mean']:.4g} ± {sx['std']:.3g}<br>"
+                        f"{labels[p_y]} = {sy['mean']:.4g} ± {sy['std']:.3g}<br>"
+                        f"ρ = {pair['rho']:+.3f}<br>FoM = {pair['fom']:.4g} {fom_ratio_text(pair['fom'], ref_fom)}"
+                    )
+                    for k, (cx, cy) in enumerate(outlines[fraction]):
+                        fig.add_trace(
+                            go.Scatter(
+                                x = cx, y = cy, mode = "lines", fill = "toself",
+                                fillcolor = hex_to_rgba(d["color"], alpha),
+                                line = dict(color = d["color"], dash = PLOTLY_DASHES[d["linestyle"]], width = 1.2),
+                                name = d["label"], legendgroup = d["label"], showlegend = False,
+                                text = text, hoverinfo = "text", hoveron = "fills+points",
+                            ),
+                            row = row, col = col,
+                        )
+                        trace_tags.append([p_x, p_y])
+
+            ### Axes: ranges, titles on the outer edge only, diagonal y hidden
+            fig.update_xaxes(range = ranges[p_x], row = row, col = col,
+                             title_text = labels[p_x] if i == n - 1 else None, showticklabels = i == n - 1)
+            if on_diagonal:
+                fig.update_yaxes(range = [0, 1.08], showticklabels = False, showgrid = False, row = row, col = col)
+            else:
+                fig.update_yaxes(range = ranges[p_y], row = row, col = col,
+                                 title_text = labels[p_y] if j == 0 else None, showticklabels = j == 0)
+                ### Every 2D panel in a row shows the same y parameter: link them
+                if j > 0:
+                    first = fig.get_subplot(row, 1).yaxis.plotly_name.replace("axis", "")
+                    fig.update_yaxes(matches = first, row = row, col = col)
+
+    size = max(220 * n, 480) + 90
+    fig.update_layout(
+        width = size + (200 if len(chains) > 1 else 0), height = size,
+        margin = dict(t = 30, l = 70, r = 20, b = 60),
+        hovermode = "closest", dragmode = "zoom",
+        legend = dict(x = 1.02, y = 1, xanchor = "left"),
+    )
+    return fig, trace_tags
 
 
 def chain_summary(chain_path, params):
@@ -888,25 +1205,16 @@ def chain_summary(chain_path, params):
         - params (list of str): parameter column names
 
         Process:
-        - Weighted mean, standard deviation, and median with the central 68%
-        interval for each parameter -- a numeric companion to the getdist plot
-        of the same chain. Uses the raw weighted samples, so it differs slightly
-        from getdist's KDE-smoothed marginals.
+        - getdist's marginal statistics for each parameter (chain_param_stats),
+        so the table agrees with the interactive plot's hover text. Parameters
+        the chain doesn't have are skipped.
 
         Outputs:
-        - list of dict: {"param", "mean", "std", "median", "lo68", "hi68"}
+        - list of dict: {"param", "mean", "std", "lo68", "hi68", "lo95", "hi95"}
         - n_eff (float): Kish effective sample size, (sum w)^2 / sum w^2
     """
-    samples, weights, pdict = load_chain_samples(chain_path)
-    rows = []
-    for param in params:
-        if param not in pdict:
-            continue
-        values = samples[:, pdict[param]]
-        mean   = np.average(values, weights = weights)
-        std    = np.sqrt(np.average((values - mean) ** 2, weights = weights))
-        lo, med, hi = weighted_quantiles(values, weights, [0.16, 0.5, 0.84])
-        rows.append({"param": param, "mean": mean, "std": std, "median": med, "lo68": lo, "hi68": hi})
+    _, weights, pdict = load_chain_samples(chain_path)
+    rows  = [{"param": p, **chain_param_stats(chain_path, p)} for p in params if p in pdict]
     n_eff = weights.sum() ** 2 / (weights ** 2).sum()
     return rows, n_eff
 
@@ -1219,7 +1527,27 @@ def search_registry(name = None, owner = None, extension = None):
         Outputs:
         - Pandas DataFrame with the REGISTRY_COLUMNS (table prefix stripped)
     """
-    query   = get_registry().Query
+    try:
+        return _search_registry(get_registry(), name, owner, extension)
+    except Exception:
+        ### A long-running server's connection can be dropped by the database
+        ### (idle timeout, restart); reconnect once before giving up
+        global _REGISTRY
+        _REGISTRY = None
+        return _search_registry(get_registry(), name, owner, extension)
+
+
+def _search_registry(registry, name, owner, extension):
+    """ _search_registry
+
+        Inputs:
+        - registry (dataregistry.DataRegistry)
+        - name, owner, extension: as for search_registry
+
+        Outputs:
+        - Pandas DataFrame, as for search_registry
+    """
+    query   = registry.Query
     filters = []
     if name:
         filters.append(query.gen_filter("dataset.name", "~=", f"*{name.strip()}*"))
@@ -1246,11 +1574,15 @@ def kill_port(port):
         - Finds any process(es) currently listening on this port (via `lsof`) and
         kills them. In debug mode, Dash's Werkzeug reloader runs as a separate
         child process, so quitting the main process alone can leave the port bound.
+        Does nothing where `lsof` isn't installed (e.g. Windows, minimal Linux).
 
         Outputs:
         - None
     """
-    result = subprocess.run(["lsof", "-ti", f":{port}"], capture_output = True, text = True)
+    try:
+        result = subprocess.run(["lsof", "-ti", f":{port}"], capture_output = True, text = True)
+    except FileNotFoundError:
+        return
     pids   = [pid for pid in result.stdout.split() if pid]
     for pid in pids:
         subprocess.run(["kill", "-9", pid])

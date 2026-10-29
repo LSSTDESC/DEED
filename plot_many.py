@@ -585,6 +585,9 @@ def main():
                         help = "dataset_id (in the working schema) to look up in the DESC Data Registry (repeatable)")
     parser.add_argument("--registry-config", default = None, help = "optional dataregistry config file (defaults to NERSC config resolution)")
     parser.add_argument("--port", type = int, default = 8050)
+    parser.add_argument("--host", default = "127.0.0.1",
+                        help = "interface to listen on (default 127.0.0.1, this machine only; pass it explicitly "
+                               "so Dash doesn't fall back on $HOST, which NERSC sets to the node's hostname)")
     args = parser.parse_args()
 
     initial_datasets = [{"path": path, "origin": "file"} for path in args.file]
@@ -611,7 +614,7 @@ def main():
         ### the parent -- it relies on the terminal delivering Ctrl+C to the whole
         ### process group. Disabling it keeps this to one process, so kill_port
         ### below reliably runs on any exit path (Ctrl+C, error, or normal return).
-        app.run(debug=True, port=args.port, use_reloader=False)
+        app.run(debug=True, host=args.host, port=args.port, use_reloader=False)
     finally:
         kill_port(args.port)
 
