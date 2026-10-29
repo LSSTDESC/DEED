@@ -106,6 +106,48 @@ DEFAULT_CHAIN_PARAMS = [
 pio.templates["source_sans"] = go.layout.Template(layout = go.Layout(font = dict(family = FONT_FAMILY)))
 pio.templates.default = "plotly+source_sans"
 
+### The multi-page app has a light / dark toggle, and draws every figure in the
+### matching theme. Backgrounds are transparent in both, so a figure takes the
+### color of the card it sits in rather than painting its own rectangle over it;
+### the dark template's text and gridlines are light enough to read on Bootstrap's
+### dark body color (#212529). THEME_INK is the color for lines drawn on top of
+### data -- e.g. the covariance block boundaries -- which have to flip too.
+THEMES    = ("light", "dark")
+THEME_INK = {"light": "#212529", "dark": "#dee2e6"}
+
+pio.templates["deed_light"] = go.layout.Template(
+    layout = go.Layout(
+        font          = dict(family = FONT_FAMILY, color = THEME_INK["light"]),
+        paper_bgcolor = "rgba(0,0,0,0)",
+        plot_bgcolor  = "rgba(0,0,0,0)",
+    )
+)
+pio.templates["deed_dark"] = go.layout.Template(
+    layout = go.Layout(
+        font          = dict(family = FONT_FAMILY, color = THEME_INK["dark"]),
+        paper_bgcolor = "rgba(0,0,0,0)",
+        plot_bgcolor  = "rgba(0,0,0,0)",
+    )
+)
+FIGURE_TEMPLATES = {"light": "plotly_white+deed_light", "dark": "plotly_dark+deed_dark"}
+
+### matplotlib settings for a chain plot on a dark page: transparent background,
+### light text, ticks and frame. make_chainplot ends in a bare plt.savefig, which
+### honours rcParams, so applying these with rc_context around the call is enough
+### -- Jessie Muir's file doesn't need to know about themes
+CHAIN_DARK_RC = {
+    "savefig.transparent": True,
+    "figure.facecolor":    "none",
+    "axes.facecolor":      "none",
+    "text.color":          THEME_INK["dark"],
+    "axes.labelcolor":     THEME_INK["dark"],
+    "axes.edgecolor":      "#adb5bd",
+    "xtick.color":         THEME_INK["dark"],
+    "ytick.color":         THEME_INK["dark"],
+    "legend.facecolor":    "none",
+    "legend.edgecolor":    "#adb5bd",
+}
+
 
 def natural_key(name):
     """ natural_key
@@ -398,7 +440,7 @@ def make_data_vector_figure(saccs, frames, data_type):
     return fig
 
 
-def make_nz_figure(saccs, nz_frames, selected_tracers):
+def make_nz_figure(saccs, nz_frames, selected_tracers, theme = "light"):
     """ make_nz_figure
 
         Inputs:
@@ -407,6 +449,8 @@ def make_nz_figure(saccs, nz_frames, selected_tracers):
         - nz_frames (list of Pandas DataFrame): the build_nz_df output for each
         entry in saccs, in the same order, containing z and n(z) per tracer
         - selected_tracers (list of str), the list of tracers whose n(z)s we are plotting
+        - theme (str): "light" or "dark"; on a dark page the tracer colors are
+        drawn from the light end of each color scale instead of the dark end
 
         Process:
         - Overlays every loaded file's n(z). Color stays keyed to the tracer, so
@@ -431,8 +475,11 @@ def make_nz_figure(saccs, nz_frames, selected_tracers):
     lens_tracers = [name for name in all_tracers if "lens" in name.lower()]
     src_tracers  = [name for name in all_tracers if name not in lens_tracers]
 
-    lens_colors = sample_colorscale("Reds",  [0.9 - 0.6 * i / max(len(lens_tracers) - 1, 1) for i in range(len(lens_tracers))])
-    src_colors  = sample_colorscale("Blues", [0.9 - 0.6 * i / max(len(src_tracers) - 1, 1) for i in range(len(src_tracers))])
+    ### The darkest shades vanish into a dark background, so a dark page samples
+    ### the scales from 0.75 down to 0.25 instead of 0.9 down to 0.3
+    top, span   = (0.75, 0.5) if theme == "dark" else (0.9, 0.6)
+    lens_colors = sample_colorscale("Reds",  [top - span * i / max(len(lens_tracers) - 1, 1) for i in range(len(lens_tracers))])
+    src_colors  = sample_colorscale("Blues", [top - span * i / max(len(src_tracers) - 1, 1) for i in range(len(src_tracers))])
     color_map   = dict(zip(lens_tracers, lens_colors)) | dict(zip(src_tracers, src_colors))
 
     ### Build the figure
@@ -501,7 +548,27 @@ def message_figure(text, height = 700, width = 750):
     return fig
 
 
-def make_covariance_figure(s, df, mode, label = None):
+def apply_theme(fig, theme):
+    """ apply_theme
+
+        Inputs:
+        - fig (plotly go.Figure)
+        - theme (str): "light" or "dark"
+
+        Process:
+        - Sets the figure's template to the one for this theme (see
+        FIGURE_TEMPLATES). Explicit layout settings on the figure still win, so
+        this only changes what the figure left to its template: backgrounds,
+        text and gridline colors.
+
+        Outputs:
+        - fig (plotly go.Figure), the same object, for chaining
+    """
+    fig.update_layout(template = FIGURE_TEMPLATES.get(theme, FIGURE_TEMPLATES["light"]))
+    return fig
+
+
+def make_covariance_figure(s, df, mode, label = None, theme = "light"):
     """ make_covariance_figure
 
         Inputs:
@@ -510,6 +577,7 @@ def make_covariance_figure(s, df, mode, label = None):
         - mode (str), one of "correlation", "covariance", "precision"
         - label (str or None): the dataset label, named in the title when
         several sacc files are loaded and this is one of them
+        - theme (str): "light" or "dark", for the color of the block boundaries
 
         Process:
         - Builds the requested matrix representation of the covariance. One file
@@ -583,8 +651,8 @@ def make_covariance_figure(s, df, mode, label = None):
 
     boundaries = df["data_type"].ne(df["data_type"].shift()).to_numpy().nonzero()[0]
     for b in boundaries[1:]:
-        fig.add_vline(x = b - 0.5, line = dict(color = "black", width = 1))
-        fig.add_hline(y = b - 0.5, line = dict(color = "black", width = 1))
+        fig.add_vline(x = b - 0.5, line = dict(color = THEME_INK[theme], width = 1))
+        fig.add_hline(y = b - 0.5, line = dict(color = THEME_INK[theme], width = 1))
 
     return fig
 
@@ -764,6 +832,85 @@ def chain_params(chain_path):
     return frozenset(k for k in pdict if k.islower() and k not in CHAIN_HOUSEKEEPING_COLS)
 
 
+@functools.lru_cache(maxsize = 4)
+def load_chain_samples(chain_path):
+    """ load_chain_samples
+
+        Inputs:
+        - chain_path (str): path to a .txt MCMC chain file
+
+        Process:
+        - Reads the chain's samples (whitespace-separated, '#' header lines) and
+        its per-sample weights: the "weight" column if there is one, else
+        exp(log_weight) rescaled to a maximum of 1, else uniform. No burn-in is
+        removed -- matching what make_chainplot does for nested-sampler chains
+        such as these PolyChord ones. Cached because the summary table is
+        rebuilt on every checklist change.
+
+        Outputs:
+        - samples (np.ndarray), one row per sample
+        - weights (np.ndarray)
+        - pdict (dict): column name -> index, from get_paramdict
+    """
+    pdict   = get_paramdict(chain_path)
+    samples = np.loadtxt(chain_path, comments = "#", ndmin = 2)
+    if "weight" in pdict:
+        weights = samples[:, pdict["weight"]]
+    elif "log_weight" in pdict:
+        log_w   = samples[:, pdict["log_weight"]]
+        weights = np.exp(log_w - log_w.max())
+    else:
+        weights = np.ones(len(samples))
+    return samples, weights, pdict
+
+
+def weighted_quantiles(values, weights, quantiles):
+    """ weighted_quantiles
+
+        Inputs:
+        - values, weights (np.ndarray): samples and their weights
+        - quantiles (sequence of float), in [0, 1]
+
+        Outputs:
+        - np.ndarray of the weighted quantiles, by interpolating the weighted CDF
+    """
+    order = np.argsort(values)
+    cdf   = np.cumsum(weights[order])
+    cdf   = (cdf - 0.5 * weights[order]) / cdf[-1]
+    return np.interp(quantiles, cdf, values[order])
+
+
+def chain_summary(chain_path, params):
+    """ chain_summary
+
+        Inputs:
+        - chain_path (str): path to a .txt MCMC chain file
+        - params (list of str): parameter column names
+
+        Process:
+        - Weighted mean, standard deviation, and median with the central 68%
+        interval for each parameter -- a numeric companion to the getdist plot
+        of the same chain. Uses the raw weighted samples, so it differs slightly
+        from getdist's KDE-smoothed marginals.
+
+        Outputs:
+        - list of dict: {"param", "mean", "std", "median", "lo68", "hi68"}
+        - n_eff (float): Kish effective sample size, (sum w)^2 / sum w^2
+    """
+    samples, weights, pdict = load_chain_samples(chain_path)
+    rows = []
+    for param in params:
+        if param not in pdict:
+            continue
+        values = samples[:, pdict[param]]
+        mean   = np.average(values, weights = weights)
+        std    = np.sqrt(np.average((values - mean) ** 2, weights = weights))
+        lo, med, hi = weighted_quantiles(values, weights, [0.16, 0.5, 0.84])
+        rows.append({"param": param, "mean": mean, "std": std, "median": med, "lo68": lo, "hi68": hi})
+    n_eff = weights.sum() ** 2 / (weights ** 2).sum()
+    return rows, n_eff
+
+
 def shared_chain_params(chains):
     """ shared_chain_params
 
@@ -796,7 +943,7 @@ def shared_chain_params(chains):
 
 
 @functools.lru_cache(maxsize = 8)
-def make_chain_figure(paths, params, labels, colors, linestyles):
+def make_chain_figure(paths, params, labels, colors, linestyles, theme = "light"):
     """ make_chain_figure
 
         Inputs (all tuples, so this is hashable and can be cached -- a triangle
@@ -808,6 +955,8 @@ def make_chain_figure(paths, params, labels, colors, linestyles):
         - labels (tuple of str): legend label per chain
         - colors (tuple of str): contour color per chain
         - linestyles (tuple of str): matplotlib linestyle per chain
+        - theme (str): "light" for the usual white-background PNG, "dark" for a
+        transparent one with light text (see CHAIN_DARK_RC); part of the cache key
 
         Process:
         - Overplots the chains with make_chainplot, which takes a list of chain
@@ -832,7 +981,7 @@ def make_chain_figure(paths, params, labels, colors, linestyles):
     ### The triangle branch (2+ parameters) handles None itself, so leave it.
     param_limits = {params[0]: None} if len(params) == 1 else None
 
-    with tempfile.TemporaryDirectory() as tmpdir:
+    with tempfile.TemporaryDirectory() as tmpdir, matplotlib.rc_context(CHAIN_DARK_RC if theme == "dark" else {}):
         make_chainplot(
             inputflist   = list(paths),
             indatdir     = "",
@@ -1018,6 +1167,69 @@ def resolve_registry_path(dataset_id, config_file=None):
     registry = DataRegistry(config_file = config_file)
     path     = registry.get_dataset_absolute_path(dataset_id, schema = "working", silent = False)
     return check_dataset_extension(path)
+
+
+### Columns shown by the Registry page, in display order
+REGISTRY_COLUMNS = [
+    "dataset.dataset_id", "dataset.name", "dataset.version_string", "dataset.owner",
+    "dataset.owner_type", "dataset.relative_path", "dataset.creation_date", "dataset.description",
+]
+REGISTRY_MAX_ROWS = 200
+
+_REGISTRY = None
+
+
+def get_registry(config_file = None):
+    """ get_registry
+
+        Inputs:
+        - config_file (str or None): dataregistry config file, None for the
+        library's default resolution (see deed_notes/open_questions.md: on NERSC
+        that currently means the shared writer config)
+
+        Process:
+        - Opens one DataRegistry connection and reuses it, so every search on the
+        Registry page doesn't pay for a new database connection
+
+        Outputs:
+        - dataregistry.DataRegistry
+    """
+    global _REGISTRY
+    if _REGISTRY is None:
+        from dataregistry import DataRegistry
+        _REGISTRY = DataRegistry(config_file = config_file)
+    return _REGISTRY
+
+
+def search_registry(name = None, owner = None, extension = None):
+    """ search_registry
+
+        Inputs:
+        - name, owner (str or None): case-insensitive substrings to match
+        - extension (str or None): ".sacc" or ".txt" to keep only files DEED can
+        load, matched against the dataset's relative path
+
+        Process:
+        - Queries the working schema's dataset table. The registry's "~=" filter
+        is a case-insensitive wildcard match ('*' is the wildcard) and is only
+        allowed on name / owner / relative_path, which is why those are the
+        search fields. Filters are ANDed. Newest dataset_id first, capped at
+        REGISTRY_MAX_ROWS.
+
+        Outputs:
+        - Pandas DataFrame with the REGISTRY_COLUMNS (table prefix stripped)
+    """
+    query   = get_registry().Query
+    filters = []
+    if name:
+        filters.append(query.gen_filter("dataset.name", "~=", f"*{name.strip()}*"))
+    if owner:
+        filters.append(query.gen_filter("dataset.owner", "~=", f"*{owner.strip()}*"))
+    if extension:
+        filters.append(query.gen_filter("dataset.relative_path", "~=", f"*{extension}"))
+
+    df = query.find_datasets(REGISTRY_COLUMNS, filters, return_format = "dataframe", strip_table_names = True)
+    return df.sort_values("dataset_id", ascending = False).head(REGISTRY_MAX_ROWS).reset_index(drop = True)
 
 
 def kill_port(port):
