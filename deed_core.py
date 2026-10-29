@@ -1219,7 +1219,27 @@ def search_registry(name = None, owner = None, extension = None):
         Outputs:
         - Pandas DataFrame with the REGISTRY_COLUMNS (table prefix stripped)
     """
-    query   = get_registry().Query
+    try:
+        return _search_registry(get_registry(), name, owner, extension)
+    except Exception:
+        ### A long-running server's connection can be dropped by the database
+        ### (idle timeout, restart); reconnect once before giving up
+        global _REGISTRY
+        _REGISTRY = None
+        return _search_registry(get_registry(), name, owner, extension)
+
+
+def _search_registry(registry, name, owner, extension):
+    """ _search_registry
+
+        Inputs:
+        - registry (dataregistry.DataRegistry)
+        - name, owner, extension: as for search_registry
+
+        Outputs:
+        - Pandas DataFrame, as for search_registry
+    """
+    query   = registry.Query
     filters = []
     if name:
         filters.append(query.gen_filter("dataset.name", "~=", f"*{name.strip()}*"))
