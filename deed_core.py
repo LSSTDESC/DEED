@@ -1574,11 +1574,15 @@ def kill_port(port):
         - Finds any process(es) currently listening on this port (via `lsof`) and
         kills them. In debug mode, Dash's Werkzeug reloader runs as a separate
         child process, so quitting the main process alone can leave the port bound.
+        Does nothing where `lsof` isn't installed (e.g. Windows, minimal Linux).
 
         Outputs:
         - None
     """
-    result = subprocess.run(["lsof", "-ti", f":{port}"], capture_output = True, text = True)
+    try:
+        result = subprocess.run(["lsof", "-ti", f":{port}"], capture_output = True, text = True)
+    except FileNotFoundError:
+        return
     pids   = [pid for pid in result.stdout.split() if pid]
     for pid in pids:
         subprocess.run(["kill", "-9", pid])
