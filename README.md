@@ -28,4 +28,4 @@ earlier front ends and still run. `app.py` and `plot_many.py` share
 `deed_core.py` for loading and figures; `plot.py` is self-contained. `tests/smoke_test.py` exercises the callbacks without a browser,
 and `tests/screenshots.py` captures every page with a headless browser.
 
-Claude assisted heavily in creating this code.
+Claude built this code with human input.
