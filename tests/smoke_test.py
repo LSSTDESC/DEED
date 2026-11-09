@@ -270,6 +270,64 @@ def test_app():
         )
         check("more than 8 parameters warns", status == 200 and "slow" in json.dumps(resp["response"]["cmp-chain-warning"]))
 
+    ### Provenance: local files are untagged, so watermarked; observed and
+    ### simulated data are never overplotted. Tags are set on the store entries
+    ### directly, since no registry dataset carries one yet.
+    WATERMARK = deed_core.PROVENANCE_WATERMARK
+
+    def annotation_texts(fig):
+        return [a.get("text", "") for a in fig.get("layout", {}).get("annotations", [])]
+
+    def dv_figure(store_data):
+        status, resp = post_callback(client, [("cmp-dv-graph", "figure")],
+                                     [("cmp-data-type", "value", "galaxy_shear_cl_ee"), ("theme-switch", "value", False),
+                                      ("dataset-store", "data", store_data)])
+        return resp["response"]["cmp-dv-graph"]["figure"] if status == 200 else {}
+
+    fig = dv_figure(datasets)
+    check("untagged data vector is watermarked", WATERMARK in annotation_texts(fig) and len(fig["data"]) > 0)
+    status, resp = post_callback(client, [("cmp-content", "children")], [store])
+    check("untagged datasets get a warning alert", status == 200 and WATERMARK in json.dumps(resp))
+
+    sacc  = datasets[0]
+    fig   = dv_figure([dict(sacc, provenance = "observation")])
+    check("tagged data vector has no watermark", WATERMARK not in annotation_texts(fig) and len(fig["data"]) > 0)
+
+    mixed = [dict(sacc, provenance = "observation"), dict(sacc, provenance = "simulation", label = "copy", slot = 1)]
+    fig   = dv_figure(mixed)
+    check("observed + simulated data vector is refused", not fig.get("data") and any("can't be overplotted" in t for t in annotation_texts(fig)))
+    status, resp = post_callback(client, [("cmp-content", "children")], [("dataset-store", "data", mixed)])
+    check("observed + simulated gets a danger alert", status == 200 and "can't be overplotted" in json.dumps(resp))
+
+    if not HAVE_CHAINS:
+        skip("provenance on chains", NO_CHAINS)
+    else:
+        chains       = [d for d in datasets if d["kind"] == "chain"]
+        mixed_chains = [dict(chains[0], provenance = "observation"), dict(chains[1], provenance = "simulation")]
+        mixed_store  = ("dataset-store", "data", mixed_chains)
+        status, resp = post_callback(
+            client, [("cmp-chain-graph", "figure"), ("cmp-chain-traces", "data"), ("cmp-chain-warning", "children")],
+            [("cmp-chain-params", "value", CHAIN_PARAMS), ("cmp-chain-mode", "value", "interactive"),
+             ("cmp-chain-ref", "value", chains[0]["path"]), ("theme-switch", "value", False), mixed_store],
+        )
+        fig = resp["response"]["cmp-chain-graph"]["figure"] if status == 200 else {}
+        check("observed + simulated chains are refused (interactive)", status == 200 and not fig.get("data"))
+        status, resp = post_callback(client, [("cmp-chain-img", "src")],
+                                     [("cmp-chain-params", "value", CHAIN_PARAMS), ("cmp-chain-mode", "value", "static"),
+                                      ("theme-switch", "value", False), mixed_store])
+        check("observed + simulated chains are refused (static)", status in (200, 204) and not (resp or {}).get("response", {}).get("cmp-chain-img", {}).get("src"))
+        status, resp = post_callback(client, [("cmp-chain-fom", "children")],
+                                     [("cmp-chain-params", "value", CHAIN_PARAMS), ("cmp-chain-ref", "value", chains[0]["path"]), mixed_store])
+        check("observed + simulated chains get no FoM table", status in (200, 204) and '"Tr"' not in json.dumps(resp))
+
+        status, resp = post_callback(
+            client, [("cmp-chain-graph", "figure"), ("cmp-chain-traces", "data"), ("cmp-chain-warning", "children")],
+            [("cmp-chain-params", "value", CHAIN_PARAMS), ("cmp-chain-mode", "value", "interactive"),
+             ("cmp-chain-ref", "value", chains[0]["path"]), ("theme-switch", "value", True), store],
+        )
+        fig = resp["response"]["cmp-chain-graph"]["figure"] if status == 200 else {}
+        check("untagged interactive chains are watermarked", WATERMARK in annotation_texts(fig))
+
     ### /explore
     status, resp = post_callback(client, [("exp-dataset", "options"), ("exp-dataset", "value")], [store], state = [("exp-dataset", "value", None)])
     check("explore selector", status == 200 and resp["response"]["exp-dataset"]["value"] == datasets[0]["path"])
@@ -315,6 +373,15 @@ def test_app():
     status, resp = update_datasets("file-add-button.n_clicks", [], file_path = SACC_PATH)
     added = resp["response"]["dataset-store"]["data"] if status == 200 else []
     check("add by path", len(added) == 1 and added[0]["kind"] == "sacc")
+    check("add by path warns: provenance unknown", status == 200 and added[0]["provenance"] == "unknown"
+          and "Warning:" in json.dumps(resp["response"]["registry-status"]))
+
+    ### A dataset tagged both observation and simulation is refused (no
+    ### registry dataset is, so the lookup is stubbed)
+    import unittest.mock
+    with unittest.mock.patch.object(deed_core, "origin_provenance", return_value = deed_core.PROVENANCE_CONFLICT):
+        new, message = deed_core.add_dataset([], SACC_PATH, origin = "registry:0")
+    check("observation + simulation tags -> error", new is deed_core.dash.no_update and message.startswith("Error") and "both" in message)
 
     status, resp = update_datasets("file-add-button.n_clicks", added, file_path = "/no/such/file.sacc")
     check("add missing file -> error", status == 200 and "no such file" in json.dumps(resp["response"]["registry-status"]))

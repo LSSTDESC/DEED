@@ -15,7 +15,7 @@ from dash import html
 from dash.dependencies import Input, Output, State
 
 from deed_core import chain_summary, data_type_label, dataset_kind, load_dataset_bundle, natural_key
-from deed_ui import card, empty_state, make_chain_view, make_sacc_tabs, origin_text, register_view_callbacks, swatch
+from deed_ui import card, empty_state, make_chain_view, make_sacc_tabs, origin_text, provenance_badge, register_view_callbacks, swatch
 from describe_file import describe_file
 
 dash.register_page(__name__, path = "/explore", name = "Explore", order = 0, title = "DEED -- Explore")
@@ -77,7 +77,8 @@ def make_description_card(entry):
         - entry (dict): the dataset entry
 
         Outputs:
-        - card with what describe_file makes of the file, and where it came from
+        - card with what describe_file makes of the file, where it came from,
+        and its provenance
     """
     desc = describe_file(entry["path"])
     return card(
@@ -90,6 +91,10 @@ def make_description_card(entry):
             ),
             html.Div(
                 [html.Span("Source ", className = "text-body-secondary"), origin_text(entry["origin"])],
+                className = "small",
+            ),
+            html.Div(
+                [html.Span("Provenance ", className = "text-body-secondary"), provenance_badge(entry)],
                 className = "small",
             ),
         ],

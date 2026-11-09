@@ -25,12 +25,15 @@ from dash.dependencies import ALL, Input, Output, State
 
 from deed_core import (
     MAX_OVERLAY,
+    PROVENANCE_CONFLICT,
     add_dataset,
     check_dataset_extension,
     dataset_file_path,
     dataset_kind,
     kill_port,
     normalize_datasets,
+    origin_provenance,
+    provenance_conflict_text,
     resolve_registry_path,
 )
 from deed_ui import make_dataset_list, status_message
@@ -304,7 +307,11 @@ def main():
             path = resolve_registry_path(dataset_id, config_file = args.registry_config)
         except Exception as e:
             parser.error(f"--registry-id {dataset_id} lookup failed: {e}")
-        INITIAL_DATASETS.append({"path": path, "origin": f"registry:{dataset_id}"})
+        origin     = f"registry:{dataset_id}"
+        provenance = origin_provenance(origin)
+        if provenance == PROVENANCE_CONFLICT:
+            parser.error(provenance_conflict_text(origin))
+        INITIAL_DATASETS.append({"path": path, "origin": origin, "provenance": provenance})
 
     for kind, cap in MAX_OVERLAY.items():
         given = [d for d in INITIAL_DATASETS if dataset_kind(d["path"]) == kind]

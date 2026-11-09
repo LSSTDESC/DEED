@@ -34,6 +34,7 @@ from deed_core import (
     FONT_FAMILY,
     LINESTYLE_NAMES,
     MAX_OVERLAY,
+    PROVENANCE_CONFLICT,
     SYMBOL_NAMES,
     add_dataset,
     check_dataset_extension,
@@ -50,6 +51,10 @@ from deed_core import (
     message_figure,
     normalize_datasets,
     option_label,
+    origin_provenance,
+    provenance_check,
+    provenance_conflict_text,
+    provenance_guarded,
     resolve_registry_path,
     shared_chain_params,
     shared_sacc_contents,
@@ -452,7 +457,7 @@ def build_app(initial_datasets=None):
         if not saccs or not data_type:
             return go.Figure()
         frames = [load_dataset_bundle(d["path"])[1] for d in saccs]
-        return make_data_vector_figure(saccs, frames, data_type)
+        return provenance_guarded(saccs, lambda: make_data_vector_figure(saccs, frames, data_type))
 
     @app.callback(
         Output("nz-graph", "figure"),
@@ -464,7 +469,7 @@ def build_app(initial_datasets=None):
         if not saccs:
             return go.Figure()
         nz_frames = [load_dataset_bundle(d["path"])[2] for d in saccs]
-        return make_nz_figure(saccs, nz_frames, selected_tracers or [])
+        return provenance_guarded(saccs, lambda: make_nz_figure(saccs, nz_frames, selected_tracers or []))
 
     @app.callback(
         Output("cov-graph", "figure"),
@@ -485,7 +490,7 @@ def build_app(initial_datasets=None):
         s, df, _, _, _, has_cov = load_dataset_bundle(entry["path"])
         if not has_cov:
             return message_figure(f"No covariance matrix present in {entry['label']}.")
-        return make_covariance_figure(s, df, mode, label = entry["label"] if len(saccs) > 1 else None)
+        return provenance_guarded([entry], lambda: make_covariance_figure(s, df, mode, label = entry["label"] if len(saccs) > 1 else None))
 
     @app.callback(
         Output("chain-graph", "src"),
@@ -497,6 +502,12 @@ def build_app(initial_datasets=None):
         if not chains or not selected_params:
             return ""
 
+        ### No image when observed and simulated chains are loaded together;
+        ### add_dataset's status line said why when the second side was added
+        mixed, untagged = provenance_check(chains)
+        if mixed:
+            return ""
+
         ### Tuples, because make_chain_figure is cached
         return make_chain_figure(
             paths      = tuple(d["path"]      for d in chains),
@@ -504,6 +515,7 @@ def build_app(initial_datasets=None):
             labels     = tuple(d["label"]     for d in chains),
             colors     = tuple(d["color"]     for d in chains),
             linestyles = tuple(d["linestyle"] for d in chains),
+            watermark  = bool(untagged),
         )
 
     ### One callback owns every write to dataset-store: two callbacks writing the
@@ -597,7 +609,11 @@ def main():
             path = resolve_registry_path(dataset_id, config_file = args.registry_config)
         except Exception as e:
             parser.error(f"--registry-id {dataset_id} lookup failed: {e}")
-        initial_datasets.append({"path": path, "origin": f"registry:{dataset_id}"})
+        origin     = f"registry:{dataset_id}"
+        provenance = origin_provenance(origin)
+        if provenance == PROVENANCE_CONFLICT:
+            parser.error(provenance_conflict_text(origin))
+        initial_datasets.append({"path": path, "origin": origin, "provenance": provenance})
 
     for kind, cap in MAX_OVERLAY.items():
         given = [d for d in initial_datasets if dataset_kind(d["path"]) == kind]

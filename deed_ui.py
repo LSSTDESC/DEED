@@ -19,7 +19,11 @@ from deed_core import (
     CHAIN_PARAMS_WARN,
     DEFAULT_CHAIN_PARAMS,
     LINESTYLE_NAMES,
+    PROVENANCE_TAGS,
+    PROVENANCE_UNKNOWN,
+    PROVENANCE_WATERMARK,
     SYMBOL_NAMES,
+    add_provenance_watermark,
     apply_theme,
     chain_pair_stats,
     chain_param_stats,
@@ -32,9 +36,12 @@ from deed_core import (
     make_interactive_chain_figure,
     make_nz_figure,
     message_figure,
+    mixed_provenance_text,
     option_label,
     param_label,
     param_pairs,
+    provenance_check,
+    provenance_guarded,
     shared_chain_params,
     shared_sacc_contents,
 )
@@ -95,8 +102,9 @@ def status_message(text):
         - text (str or None): status line from adding / removing a dataset
 
         Process:
-        - Messages starting with "Error" are shown in the danger color, anything
-        else muted, so a failed add is noticeable without a modal
+        - Messages starting with "Error" are shown in the danger color, ones
+        carrying a "Warning" in the warning color, anything else muted, so a
+        failed or doubtful add is noticeable without a modal
 
         Outputs:
         - html.Div, or None for no message
@@ -104,7 +112,9 @@ def status_message(text):
     if not text:
         return None
     is_error = text.startswith("Error") or "must be" in text
-    return html.Div(text, className = "text-danger" if is_error else "text-body-secondary")
+    if is_error:
+        return html.Div(text, className = "text-danger")
+    return html.Div(text, className = "text-warning-emphasis" if "Warning:" in text else "text-body-secondary")
 
 
 def swatch(entry):
@@ -131,6 +141,55 @@ def origin_text(origin):
     if origin.startswith("registry:"):
         return f"Data Registry, dataset_id {origin.split(':', 1)[1]}"
     return "local file"
+
+
+def provenance_badge(entry):
+    """ provenance_badge
+
+        Inputs:
+        - entry (dict): a dataset entry
+
+        Outputs:
+        - a badge naming the dataset's provenance, in the warning color when it
+        has not been established (dbc.Badge)
+    """
+    provenance = entry.get("provenance", PROVENANCE_UNKNOWN)
+    if provenance not in PROVENANCE_TAGS:
+        return dbc.Badge("provenance unknown", color = "warning", text_color = "dark", className = "me-1",
+                         title = PROVENANCE_WATERMARK)
+    return dbc.Badge(provenance, color = "info", text_color = "dark", className = "me-1")
+
+
+def provenance_alert(entries):
+    """ provenance_alert
+
+        Inputs:
+        - entries (list of dict): the dataset entries a view draws
+
+        Process:
+        - Explains, above the view, why its figures are missing (observed and
+        simulated data loaded together, which can't be overplotted yet) or
+        watermarked (datasets whose provenance has not been established).
+
+        Outputs:
+        - dbc.Alert, or None if there is nothing to say
+    """
+    mixed, untagged = provenance_check(entries)
+    if mixed:
+        return dbc.Alert(
+            mixed_provenance_text(entries) + " Each can still be viewed on its own on the Explore page.",
+            color = "danger", className = "py-2 small",
+        )
+    if untagged:
+        return dbc.Alert(
+            [
+                html.Strong(f"{PROVENANCE_WATERMARK} "),
+                f"for {', '.join(untagged)}: tagged neither observation nor simulation in the Data Registry "
+                f"(local files never are). Plots are watermarked.",
+            ],
+            color = "warning", className = "py-2 small",
+        )
+    return None
 
 
 def make_dataset_list(datasets):
@@ -168,7 +227,7 @@ def make_dataset_list(datasets):
                             [
                                 html.Div(d["label"], className = "fw-semibold text-break"),
                                 html.Div(
-                                    [dbc.Badge(d["kind"], color = "secondary", className = "me-1"), channel],
+                                    [dbc.Badge(d["kind"], color = "secondary", className = "me-1"), provenance_badge(d), channel],
                                     className = "small text-body-secondary",
                                 ),
                                 html.Div(origin_text(d["origin"]), className = "small text-body-secondary text-break"),
@@ -264,9 +323,10 @@ def make_sacc_tabs(saccs, prefix):
         tracer checklist offer the union over the files, annotated with which
         files lack an option (see shared_sacc_contents), so nothing vanishes from
         the controls because one file doesn't have it.
+        - Above the tabs, the provenance alert (see provenance_alert).
 
         Outputs:
-        - dbc.Tabs
+        - html.Div holding the alert and the dbc.Tabs
     """
     data_types, tracers, missing = shared_sacc_contents(saccs)
 
@@ -310,7 +370,7 @@ def make_sacc_tabs(saccs, prefix):
         dcc.Graph(id = f"{prefix}-nz-graph", config = GRAPH_CONFIG),
     ]
 
-    return dbc.Tabs(
+    tabs = dbc.Tabs(
         [
             dbc.Tab(data_vector_tab, label = "Data vector", tab_id = "dv"),
             dbc.Tab(nz_tab, label = "n(z)", tab_id = "nz"),
@@ -319,6 +379,7 @@ def make_sacc_tabs(saccs, prefix):
         active_tab = "dv",
         className  = "mb-3",
     )
+    return html.Div([provenance_alert(saccs), tabs])
 
 
 ### ----------------------------------------------------------- chain views
@@ -341,6 +402,7 @@ def make_chain_view(chains, prefix, with_summary = False):
         PNG, chosen with a switch; a reference-chain selector for FoM ratios
         (hidden with one chain); the pinned-statistics card; and a table of
         every parameter pair's figure of merit per chain.
+        - The provenance alert (see provenance_alert) at the top.
 
         Outputs:
         - children (list of components)
@@ -353,7 +415,7 @@ def make_chain_view(chains, prefix, with_summary = False):
     options = [{"label": p, "value": p} for p in shared]
     options += [{"label": f"{p} (not in {', '.join(missing[p])})", "value": p, "disabled": True} for p in missing]
 
-    children = []
+    children = [provenance_alert(chains)]
     if missing:
         children.append(
             dbc.Alert(
@@ -579,7 +641,7 @@ def register_view_callbacks(prefix, select, extra_inputs = ()):
         if not saccs or not data_type:
             return apply_theme(go.Figure(), theme)
         frames = [load_dataset_bundle(d["path"])[1] for d in saccs]
-        return apply_theme(make_data_vector_figure(saccs, frames, data_type), theme)
+        return apply_theme(provenance_guarded(saccs, lambda: make_data_vector_figure(saccs, frames, data_type), theme), theme)
 
     @dash.callback(
         Output(f"{prefix}-nz-graph", "figure"),
@@ -592,7 +654,7 @@ def register_view_callbacks(prefix, select, extra_inputs = ()):
         if not saccs:
             return apply_theme(go.Figure(), theme)
         nz_frames = [load_dataset_bundle(d["path"])[2] for d in saccs]
-        return apply_theme(make_nz_figure(saccs, nz_frames, selected_tracers or [], theme = theme), theme)
+        return apply_theme(provenance_guarded(saccs, lambda: make_nz_figure(saccs, nz_frames, selected_tracers or [], theme = theme), theme), theme)
 
     @dash.callback(
         Output(f"{prefix}-cov-graph", "figure"),
@@ -612,8 +674,9 @@ def register_view_callbacks(prefix, select, extra_inputs = ()):
         s, df, _, _, _, has_cov = load_dataset_bundle(entry["path"])
         if not has_cov:
             return apply_theme(message_figure(f"No covariance matrix in {entry['label']}."), theme)
+        ### One file at a time, so never mixed -- but still watermarked
         label = entry["label"] if len(saccs) > 1 else None
-        return apply_theme(make_covariance_figure(s, df, mode, label = label), theme)
+        return apply_theme(provenance_guarded([entry], lambda: make_covariance_figure(s, df, mode, label = label), theme), theme)
 
     def selected_chains_and_params(datasets, selected_params, extra):
         ### The checklist reports parameters in click order; plot them in the
@@ -645,6 +708,9 @@ def register_view_callbacks(prefix, select, extra_inputs = ()):
         chains, params = selected_chains_and_params(datasets, selected_params, extra)
         if mode == "static" or not chains or not params:
             return apply_theme(go.Figure(), theme), [], None
+        mixed, untagged = provenance_check(chains)
+        if mixed:
+            return apply_theme(message_figure(mixed_provenance_text(chains)), theme), [], None
         warning = None
         if len(params) > CHAIN_PARAMS_WARN:
             warning = dbc.Alert(
@@ -653,6 +719,8 @@ def register_view_callbacks(prefix, select, extra_inputs = ()):
                 color = "warning", className = "py-2 small",
             )
         fig, trace_tags = make_interactive_chain_figure(chains, params, reference = ref_path)
+        if untagged:
+            add_provenance_watermark(fig, theme)
         return apply_theme(fig, theme), trace_tags, warning
 
     ### The pin is held as the panel's parameters, not as a trace index, so it
@@ -696,7 +764,8 @@ def register_view_callbacks(prefix, select, extra_inputs = ()):
     )
     def update_chain_fom(selected_params, ref_path, datasets, *extra):
         chains, params = selected_chains_and_params(datasets, selected_params, extra)
-        if not chains or not params:
+        ### FoM ratios compare the chains, so they're held back with the plot
+        if not chains or not params or provenance_check(chains)[0]:
             return None
         ref_path = ref_path if any(d["path"] == ref_path for d in chains) else chains[0]["path"]
         return make_fom_table(chains, params, ref_path)
@@ -712,6 +781,11 @@ def register_view_callbacks(prefix, select, extra_inputs = ()):
         ### The PNG takes a second or more, so it's only rendered when shown
         if mode != "static" or not chains or not selected_params:
             return ""
+        ### No image when observed and simulated chains are loaded together;
+        ### the view's provenance alert says why
+        mixed, untagged = provenance_check(chains)
+        if mixed:
+            return ""
         ### Tuples, because make_chain_figure is cached
         return make_chain_figure(
             paths      = tuple(d["path"] for d in chains),
@@ -720,4 +794,5 @@ def register_view_callbacks(prefix, select, extra_inputs = ()):
             colors     = tuple(d["color"] for d in chains),
             linestyles = tuple(d["linestyle"] for d in chains),
             theme      = theme_of(dark),
+            watermark  = bool(untagged),
         )

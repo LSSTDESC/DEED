@@ -102,6 +102,21 @@ DEFAULT_CHAIN_PARAMS = [
     "cosmological_parameters--sigma_8",
 ]
 
+### Where a dataset's data came from, read off the DESC Data Registry's preset
+### system keywords. Observed and simulated data can't be overplotted yet, and a
+### dataset carrying neither keyword -- every local file, and so far every
+### registry dataset -- has no established provenance, so whatever is drawn from
+### it is watermarked. A dataset tagged with both is, for now, an error: it is
+### refused when added (2026-11-08, Leo's call; to be revisited).
+PROVENANCE_TAGS      = ("observation", "simulation")
+PROVENANCE_UNKNOWN   = "unknown"
+PROVENANCE_CONFLICT  = "conflict"
+PROVENANCE_WATERMARK = "Data provenance has not been established"
+
+### The watermark's (r, g, b, alpha) per theme: faint enough to read the figure
+### through, and lighter on dark pages, where the same grey all but disappears
+WATERMARK_RGBA = {"light": (128, 128, 128, 0.35), "dark": (173, 181, 189, 0.45)}
+
 ### Layer a font-only template on top of the default "plotly" template, so every
 ### figure created below picks up Source Sans without needing font= on each call
 pio.templates["source_sans"] = go.layout.Template(layout = go.Layout(font = dict(family = FONT_FAMILY)))
@@ -663,12 +678,17 @@ def make_covariance_figure(s, df, mode, label = None):
 ### is a plain dict (it lives in a dcc.Store, so it has to be JSON-serializable):
 ###
 ###   {"path": str, "origin": str, "kind": "chain"|"sacc", "label": str,
-###    "slot": int, "color": str, "linestyle": str, "symbol": str|None}
+###    "slot": int, "color": str, "linestyle": str, "symbol": str|None,
+###    "provenance": "observation"|"simulation"|"unknown"}
+###
+### ("conflict", for a dataset tagged both, never reaches an entry: add_dataset
+### and the command lines refuse it.)
 ###
 ### "symbol" is None for chains, which have no markers to style.
 ###
 ### Only "path" and "origin" are supplied when a dataset is added; the rest are
-### filled in by normalize_datasets.
+### filled in by normalize_datasets. "provenance" is looked up once, when the
+### dataset is added, and then carried along with the entry.
 def dataset_kind(path):
     """ dataset_kind
 
@@ -766,12 +786,14 @@ def normalize_datasets(items):
     for item in items or []:
         item = {"path": item} if isinstance(item, str) else dict(item)
         path = os.path.abspath(os.path.expanduser(item["path"]))
+        origin = item.get("origin", "file")
         entries.append(
             {
-                "path":   path,
-                "origin": item.get("origin", "file"),
-                "kind":   dataset_kind(path),
-                "slot":   item.get("slot"),
+                "path":       path,
+                "origin":     origin,
+                "kind":       dataset_kind(path),
+                "slot":       item.get("slot"),
+                "provenance": item.get("provenance") or origin_provenance(origin),
             }
         )
 
@@ -809,6 +831,215 @@ def datasets_of_kind(datasets, kind):
         - the subset of entries of that kind, in load order
     """
     return [d for d in (datasets or []) if d["kind"] == kind]
+
+
+def origin_provenance(origin):
+    """ origin_provenance
+
+        Inputs:
+        - origin (str): "file", or "registry:<dataset_id>"
+
+        Process:
+        - A local file carries no tags, so its provenance is unknown. A registry
+        dataset's comes from its keywords (see registry_provenance).
+
+        Outputs:
+        - "observation", "simulation", PROVENANCE_UNKNOWN or PROVENANCE_CONFLICT
+    """
+    if origin.startswith("registry:"):
+        return registry_provenance(int(origin.split(":", 1)[1]))
+    return PROVENANCE_UNKNOWN
+
+
+def registry_provenance(dataset_id):
+    """ registry_provenance
+
+        Inputs:
+        - dataset_id (int): dataset_id in the registry's working schema
+
+        Process:
+        - Reads the dataset's keywords and keeps the provenance tags among them.
+        Exactly one tag establishes the provenance; none, or a failed lookup,
+        leave it unknown; both is a conflict. A failed lookup shouldn't stop the
+        dataset loading -- it only means its plots get the watermark.
+
+        Outputs:
+        - "observation", "simulation", PROVENANCE_UNKNOWN or PROVENANCE_CONFLICT
+    """
+    try:
+        keywords = registry_keywords(dataset_id)
+    except Exception:
+        return PROVENANCE_UNKNOWN
+    tags = [tag for tag in PROVENANCE_TAGS if tag in keywords]
+    if len(tags) > 1:
+        return PROVENANCE_CONFLICT
+    return tags[0] if tags else PROVENANCE_UNKNOWN
+
+
+def provenance_conflict_text(origin):
+    """ provenance_conflict_text
+
+        Inputs:
+        - origin (str): "registry:<dataset_id>" of a dataset tagged both ways
+
+        Outputs:
+        - why the dataset is refused (str)
+    """
+    return (
+        f"{origin.replace('registry:', 'dataset_id ')} is tagged both observation and simulation in the "
+        f"Data Registry, so its provenance is contradictory; fix its keywords before loading it."
+    )
+
+
+@functools.lru_cache(maxsize = 128)
+def registry_keywords(dataset_id):
+    """ registry_keywords
+
+        Inputs:
+        - dataset_id (int): dataset_id in the registry's working schema
+
+        Process:
+        - Queries the keywords attached to the dataset. Cached, because the
+        multi-page app renormalizes its startup datasets on every page load; a
+        failed lookup raises and so is not cached.
+
+        Outputs:
+        - frozenset of str
+    """
+    def query(registry):
+        q  = registry.Query
+        ### The filter joins the dataset table, so the column keeps its table
+        ### prefix (strip_table_names only works for single-table queries)
+        df = q.find_datasets(["keyword.keyword"], [q.gen_filter("dataset.dataset_id", "==", dataset_id)],
+                             return_format = "dataframe")
+        ### No match comes back as a DataFrame without any columns at all
+        return frozenset(df["keyword.keyword"]) if "keyword.keyword" in df else frozenset()
+
+    try:
+        return query(get_registry())
+    except Exception:
+        ### Reconnect once, as search_registry does
+        global _REGISTRY
+        _REGISTRY = None
+        return query(get_registry())
+
+
+def provenance_check(entries):
+    """ provenance_check
+
+        Inputs:
+        - entries (list of dict): the dataset entries one figure draws
+
+        Outputs:
+        - mixed (bool): True if they hold both observed and simulated data,
+        which can't be overplotted yet
+        - untagged (list of str): labels of the entries whose provenance has
+        not been established
+    """
+    tags     = {d.get("provenance", PROVENANCE_UNKNOWN) for d in entries}
+    mixed    = set(PROVENANCE_TAGS) <= tags
+    untagged = [d["label"] for d in entries if d.get("provenance", PROVENANCE_UNKNOWN) not in PROVENANCE_TAGS]
+    return mixed, untagged
+
+
+def mixed_provenance_text(entries):
+    """ mixed_provenance_text
+
+        Inputs:
+        - entries (list of dict): dataset entries holding both observed and
+        simulated data
+
+        Outputs:
+        - why the figure isn't drawn, naming the datasets on each side (str)
+    """
+    sides = [
+        f"{tag}: {', '.join(d['label'] for d in entries if d.get('provenance') == tag)}"
+        for tag in PROVENANCE_TAGS
+    ]
+    return f"Observed and simulated data can't be overplotted yet ({'; '.join(sides)}). Remove one side to draw this view."
+
+
+def add_provenance_watermark(fig, theme = "light"):
+    """ add_provenance_watermark
+
+        Inputs:
+        - fig (plotly go.Figure)
+        - theme (str): "light" or "dark", for the watermark's color
+
+        Process:
+        - Lays PROVENANCE_WATERMARK diagonally across the whole figure, in a
+        translucent grey (see WATERMARK_RGBA). It's an annotation, so it stays
+        on the PNG that Plotly's modebar downloads.
+
+        Outputs:
+        - fig (plotly go.Figure), the same object, for chaining
+    """
+    fig.add_annotation(
+        text      = PROVENANCE_WATERMARK,
+        showarrow = False,
+        xref      = "paper",
+        yref      = "paper",
+        x         = 0.5,
+        y         = 0.5,
+        textangle = -30,
+        font      = dict(size = 36, color = "rgba({}, {}, {}, {})".format(*WATERMARK_RGBA.get(theme, WATERMARK_RGBA["light"]))),
+    )
+    return fig
+
+
+def provenance_guarded(entries, build, theme = "light"):
+    """ provenance_guarded
+
+        Inputs:
+        - entries (list of dict): the dataset entries one figure draws
+        - build (callable): build() -> the figure (plotly go.Figure)
+        - theme (str): "light" or "dark", for the watermark's color
+
+        Process:
+        - Refuses to overplot observed with simulated data, returning a message
+        figure in its place; otherwise builds the figure and watermarks it if
+        any of the entries has no established provenance.
+
+        Outputs:
+        - fig (plotly go.Figure)
+    """
+    mixed, untagged = provenance_check(entries)
+    if mixed:
+        return message_figure(mixed_provenance_text(entries))
+    fig = build()
+    return add_provenance_watermark(fig, theme) if untagged else fig
+
+
+def watermark_png(png_path, theme = "light"):
+    """ watermark_png
+
+        Inputs:
+        - png_path (str): a PNG written by make_chainplot
+        - theme (str): "light" or "dark", for the watermark's color
+
+        Process:
+        - Redraws the image pixel for pixel with PROVENANCE_WATERMARK across it,
+        overwriting the file. Transparency is kept, so the dark theme's
+        transparent PNG stays transparent.
+
+        Outputs:
+        - None
+    """
+    import matplotlib.figure
+    import matplotlib.image
+
+    image         = matplotlib.image.imread(png_path)
+    height, width = image.shape[:2]
+
+    fig = matplotlib.figure.Figure(figsize = (width / 100, height / 100), dpi = 100)
+    ax  = fig.add_axes([0, 0, 1, 1])
+    ax.imshow(image, interpolation = "none")
+    ax.set_axis_off()
+    ### Sized so the text spans roughly two thirds of the image's width
+    r, g, b, alpha = WATERMARK_RGBA.get(theme, WATERMARK_RGBA["light"])
+    fig.text(0.5, 0.5, PROVENANCE_WATERMARK, rotation = 30, ha = "center", va = "center",
+             fontsize = width / 45, color = (r / 255, g / 255, b / 255), alpha = alpha)
+    fig.savefig(png_path, dpi = 100, transparent = True)
 
 
 @functools.lru_cache(maxsize = 32)
@@ -1251,7 +1482,7 @@ def shared_chain_params(chains):
 
 
 @functools.lru_cache(maxsize = 8)
-def make_chain_figure(paths, params, labels, colors, linestyles, theme = "light"):
+def make_chain_figure(paths, params, labels, colors, linestyles, theme = "light", watermark = False):
     """ make_chain_figure
 
         Inputs (all tuples, so this is hashable and can be cached -- a triangle
@@ -1265,6 +1496,8 @@ def make_chain_figure(paths, params, labels, colors, linestyles, theme = "light"
         - linestyles (tuple of str): matplotlib linestyle per chain
         - theme (str): "light" for the usual white-background PNG, "dark" for a
         transparent one with light text (see CHAIN_DARK_RC); part of the cache key
+        - watermark (bool): lay PROVENANCE_WATERMARK across the plot (see
+        watermark_png), for chains whose provenance has not been established
 
         Process:
         - Overplots the chains with make_chainplot, which takes a list of chain
@@ -1303,6 +1536,8 @@ def make_chain_figure(paths, params, labels, colors, linestyles, theme = "light"
             ftype        = "png",
             clearfig     = True,
         )
+        if watermark:
+            watermark_png(os.path.join(tmpdir, "chain_plot.png"), theme)
         with open(os.path.join(tmpdir, "chain_plot.png"), "rb") as f:
             encoded = base64.b64encode(f.read()).decode("ascii")
     return f"data:image/png;base64,{encoded}"
@@ -1405,6 +1640,11 @@ def add_dataset(datasets, path, origin):
         - Appends the dataset, refusing duplicates and refusing to exceed
         MAX_OVERLAY[kind] datasets of that kind (past that there are no unique
         (color, linestyle/symbol) pairs left to tell them apart with)
+        - Refuses a dataset tagged both observation and simulation (an error,
+        for now -- see PROVENANCE_CONFLICT)
+        - Warns, in the status message, if the dataset's provenance has not been
+        established, or if it won't be overplotted with datasets already loaded
+        because one is observed and the other simulated
 
         Outputs:
         - datasets (list of dict) or dash.no_update
@@ -1420,8 +1660,21 @@ def add_dataset(datasets, path, origin):
             f"told apart -- remove one first."
         )
 
-    datasets = normalize_datasets(datasets + [{"path": path, "origin": origin}])
-    return datasets, f"Added {os.path.basename(path)} ({kind}, from {origin})."
+    provenance = origin_provenance(origin)
+    if provenance == PROVENANCE_CONFLICT:
+        return dash.no_update, f"Error: {provenance_conflict_text(origin)}"
+
+    datasets = normalize_datasets(datasets + [{"path": path, "origin": origin, "provenance": provenance}])
+    message  = f"Added {os.path.basename(path)} ({kind}, from {origin})."
+
+    if provenance == PROVENANCE_UNKNOWN:
+        message += (
+            " Warning: it is tagged neither observation nor simulation, so its data provenance has not been "
+            "established and its plots are watermarked."
+        )
+    elif provenance_check(datasets_of_kind(datasets, kind))[0]:
+        message += f" Warning: it is {provenance} data, so it won't be overplotted with the other side's {kind} datasets."
+    return datasets, message
 
 
 def check_dataset_extension(path):
